@@ -1,0 +1,14 @@
+# real deployment config — never commit (copy scripts/farm.conf.example -> farm.conf)
+farm.conf
+scripts/farm.conf
+
+# runtime artifacts
+*.log
+state.tsv
+state.remote
+src.*
+out.*
+
+# OS / editor junk
+.DS_Store
+*.swp

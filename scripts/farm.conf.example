@@ -1,0 +1,39 @@
+# farm.conf — deployment config for the distributed HEVC farm.
+# Copy to farm.conf and edit. farm.conf is gitignored — keep your real IPs/library private.
+# This file is sourced by farm-deploy.sh (plain bash; arrays allowed).
+
+# launchd label + the user the per-node daemon runs as (must have passwordless ssh to the NAS)
+LABEL="com.example.hevc-farm"
+NODE_USER="you"
+
+# per-node install dir (holds the worker script, state, logs) + path to bash 5+ on each node
+NODE_DIR="/Users/you/hevc-farm"
+NODE_BASH="/opt/homebrew/bin/bash"
+
+# the NAS (file server): ssh host, media library root, shared progress-state file
+NAS="nas.lan"
+REMOTE_ROOT="/srv/media/TV"
+STATE_REMOTE="/srv/media/TV/.hevc-farm-state.tsv"
+
+# persistent ffmpeg container on the NAS used for fast remote probing (docker exec)
+PROBE_CTR="hevc-probe"
+# If that container sees the library at a different mount than the NAS host path, set both so
+# state keys line up (host prefix -> container prefix). Leave as "/" for no remapping.
+MEDIA_HOST="/srv/media"
+MEDIA_CANON="/media"
+
+VT_QUALITY="60"   # hevc_videotoolbox -q:v (1-100, higher = better/bigger)
+
+# ---- nodes: one entry per Apple Silicon Mac ----
+HOSTS=(10.0.0.11 10.0.0.12 10.0.0.13)
+
+# concurrent encodes per node (an Ultra handles ~3; a Max / laptop ~2)
+declare -A CONC=( [10.0.0.11]=3 [10.0.0.12]=3 [10.0.0.13]=2 )
+
+# DISJOINT slice of library subdirectories per node (newline-separated, exact dir names under REMOTE_ROOT)
+declare -A SLICE
+SLICE[10.0.0.11]='Show One
+Show Two'
+SLICE[10.0.0.12]='Show Three
+Show Four'
+SLICE[10.0.0.13]='Show Five'
