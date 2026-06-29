@@ -17,7 +17,7 @@ start(){
   sudo docker run -d --name "$NAME" --restart unless-stopped \
     --device /dev/dri:/dev/dri --cpus="${CPUS:-4}" --memory="${MEM:-3g}" \
     -v "$MEDIA_DIR":/media -v "$WORKDIR":/work -v "$SCRIPT":/h.sh:ro \
-    -e WORK=/work \
+    -e WORK=/work -e HEVC_LIB=/work/hevc-lib.sh \
     -e QUALITY="${QUALITY:-22}" -e PRESET="${PRESET:-slow}" \
     -e REPLACE_MODE="${REPLACE_MODE:-trash}" -e TRASH_CAP_GB="${TRASH_CAP_GB:-80}" \
     -e SLEEP_BETWEEN="${SLEEP_BETWEEN:-45}" -e MIN_FREE_GB="${MIN_FREE_GB:-200}" \
@@ -36,6 +36,13 @@ status(){
 }
 logs(){ sudo docker logs --tail "${1:-40}" "$NAME" 2>&1 | grep -vE "libva info|setlocale" || true; }
 stats(){ sudo docker stats --no-stream "$NAME"; }
+savings(){  # exact lifetime totals from the durable ledger (survives log rotation)
+  local sf="$WORKDIR/savings.tsv"
+  [ -s "$sf" ] || { echo "no savings recorded yet ($sf)"; return; }
+  sudo awk -F'\t' '{b+=$3;a+=$4;n++} END{if(b<=0){print "ledger empty";exit}
+    printf "converted %d files: %.2f TB -> %.2f TB  (saved %.2f TB, %.0f%% smaller)\n",
+    n,b/2^40,a/2^40,(b-a)/2^40,100*(b-a)/b}' "$sf"
+}
 
 case "${1:-status}" in
   start)   start ;;
@@ -44,5 +51,6 @@ case "${1:-status}" in
   status)  status ;;
   logs)    logs "${2:-40}" ;;
   stats)   stats ;;
-  *) echo "usage: $0 {start|stop|restart|status|logs [N]|stats}";;
+  savings) savings ;;
+  *) echo "usage: $0 {start|stop|restart|status|logs [N]|stats|savings}";;
 esac

@@ -19,6 +19,9 @@ REMOTE_ROOT="${REMOTE_ROOT:?set REMOTE_ROOT in farm.conf — media library root}
 SLICE="${SLICE:?set SLICE to newline-separated show-dir names under REMOTE_ROOT}"
 WORK="${WORK:-$HOME/hevc-farm}"                             # local scratch + state + log
 STATE_REMOTE="${STATE_REMOTE:-$REMOTE_ROOT/.hevc-farm-state.tsv}"  # shared progress state on the NAS
+CLAIMS_REMOTE="${CLAIMS_REMOTE:-$REMOTE_ROOT/.hevc-claims}"   # per-file claim dirs (atomic mkdir) so 2 nodes don't both encode one file
+CLAIM_TTL_MIN="${CLAIM_TTL_MIN:-180}"                          # steal/expire a claim older than this (covers a crashed node)
+SAVINGS_REMOTE="${SAVINGS_REMOTE:-$REMOTE_ROOT/.hevc-savings.tsv}"  # shared durable before/after byte ledger
 VT_QUALITY="${VT_QUALITY:-60}"                              # hevc_videotoolbox -q:v (1-100)
 MAX_W="${MAX_W:-1920}"; MAX_H="${MAX_H:-1080}"              # only-downscale ceiling
 MIN_SRC_KBPS="${MIN_SRC_KBPS:-3000}"                        # skip sources already leaner
@@ -31,7 +34,7 @@ ONESHOT="${ONESHOT:-0}"; LIMIT="${LIMIT:-0}"; DRY_RUN="${DRY_RUN:-0}"; RETRY_FAI
 CONCURRENCY="${CONCURRENCY:-1}"          # parallel encodes per worker (Apple Silicon media engine handles 2-3)
 { [ "$LIMIT" -gt 0 ] || [ "$DRY_RUN" = 1 ]; } && CONCURRENCY=1   # keep tests deterministic / sequential
 HOSTTAG="${HOSTTAG:-$(hostname -s)}"
-SSH="ssh -o ConnectTimeout=10 -o BatchMode=yes"
+SSH="${SSH:-ssh -o ConnectTimeout=10 -o BatchMode=yes}"
 # State.tsv keys may use a different path namespace than our ssh/find paths: the probe
 # container sees the library at a mount path (MEDIA_CANON) while the NAS host path is
 # MEDIA_HOST. canon() maps host->canon so dedup against the shared state lines up.
@@ -41,8 +44,10 @@ canon(){ printf '%s' "${1/#$MEDIA_HOST/$MEDIA_CANON}"; }
 
 mkdir -p "$WORK"
 LOG="$WORK/farm.log"; STATE_LOCAL="$WORK/state.tsv"; touch "$STATE_LOCAL"
+SAVINGS="${SAVINGS:-$WORK/savings.tsv}"   # durable, never-rotated before/after byte ledger
 log(){ printf '%s [%s] %s\n' "$(date '+%F %T')" "$HOSTTAG" "$*" | tee -a "$LOG" >&2; }
-hsize(){ awk -v b="${1:-0}" 'BEGIN{u="B";s=b;split("K M G T",a);for(i=1;i<=4&&s>=1024;i++){s/=1024;u=a[i]"B"}printf "%.1f%s",s,u}'; }
+# shared logic — hsize/classify/calc_scale/verify/compact_state/record_savings (co-located lib)
+source "${HEVC_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hevc-lib.sh}"
 
 # single instance (atomic mkdir + PID lock; macOS has no flock)
 LOCKD="$WORK/.lock.d"
@@ -65,6 +70,7 @@ state_set(){
 # pull the shared state -> DONE[path]=status, so we skip what the QSV daemon already did
 declare -A DONE
 load_state(){
+  compact_state "$STATE_LOCAL"   # single-writer (lock.d) — safe to dedupe in place
   DONE=(); local cache="$WORK/state.remote"
   $SSH "$NAS" "cat ${STATE_REMOTE@Q}" </dev/null >"$cache" 2>/dev/null || true
   local p s
@@ -87,21 +93,8 @@ remote_probe(){
   : "${V_W:=0}" "${V_H:=0}" "${SIZE:=0}"; EFFKBPS=0
   [ -n "${DUR:-}" ] && awk "BEGIN{exit !(${DUR:-0}>0)}" && EFFKBPS=$(awk "BEGIN{printf \"%d\",($SIZE*8)/$DUR/1000}")
 }
-classify(){
-  case "$V_CODEC" in hevc|h265|av1) echo "skip:already-hevc"; return;; esac
-  case "$V_TRC"  in smpte2084|arib-std-b67) echo "skip:hdr"; return;; esac
-  case "$V_PRIM" in bt2020|bt2020nc|bt2020c) echo "skip:hdr"; return;; esac
-  { [ "$V_W" -ge 1920 ] 2>/dev/null || [ "$V_H" -ge 1080 ] 2>/dev/null; } || { echo "skip:lowres"; return; }
-  [ "${EFFKBPS:-0}" -lt "$MIN_SRC_KBPS" ] && { echo "skip:lowbitrate"; return; }
-  echo "convert"
-}
-calc_scale(){
-  SCALE_W=""; SCALE_H=""
-  awk "BEGIN{exit !($V_W<=$MAX_W && $V_H<=$MAX_H)}" && return
-  read -r SCALE_W SCALE_H < <(awk -v w="$V_W" -v h="$V_H" -v mw="$MAX_W" -v mh="$MAX_H" 'BEGIN{
-    f=mw/w; g=mh/h; s=(f<g)?f:g; nw=int(w*s); nh=int(h*s); nw-=nw%2; nh-=nh%2;
-    if(nw<2)nw=2; if(nh<2)nh=2; printf "%d %d",nw,nh}')
-}
+# classify() and calc_scale() now live in hevc-lib.sh (sourced above)
+
 # encode LOCAL src -> LOCAL tmp via VideoToolbox -> 0 ok
 encode(){
   local src="$1" tmp="$2" fmt="$3"
@@ -116,15 +109,26 @@ encode(){
   ffmpeg -nostdin -hide_banner -loglevel error -y -i "$src" "${vf[@]}" -map 0:v:0 -map '0:a?' -sn "${enc[@]}" "${out[@]}" 2>>"$LOG" && return 0
   return 1
 }
-verify(){
-  local tmp="$1" oc od
-  [ -s "$tmp" ] || { log "  verify: empty output"; return 1; }
-  oc=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$tmp" 2>/dev/null)
-  [ "$oc" = hevc ] || { log "  verify: out codec=$oc"; return 1; }
-  od=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$tmp" 2>/dev/null)
-  awk -v a="${DUR:-0}" -v b="${od:-0}" 'BEGIN{d=a-b;if(d<0)d=-d;tol=a*0.01;if(tol<3)tol=3;exit !(b>0&&d<=tol)}' \
-    || { log "  verify: duration mismatch src=$DUR out=$od"; return 1; }
-  return 0
+# verify() now lives in hevc-lib.sh (sourced above) — incl. the decode-sample check
+
+# claim a file before pulling so two nodes never both encode it (#1). Atomic mkdir on
+# the NAS; steal a claim older than CLAIM_TTL_MIN (crashed node). No explicit release:
+# done files are skipped via state, failed files cool off for the TTL, and stale claim
+# dirs are reaped at pass start — TTL expiry is the release.
+# ponytail: mkdir-atomic on the common path; the stale-steal branch can race two nodes
+# onto ONE stale file (rare, costs one duplicate encode) — fine vs a lease server.
+claim(){  # remote-path -> 0 if we now own it
+  { [ "$DRY_RUN" = 1 ] || [ "$LIMIT" -gt 0 ]; } && return 0   # tests: don't touch the NAS
+  local k cd; k=$(printf '%s' "$1" | shasum 2>/dev/null | cut -c1-40)
+  [ -n "$k" ] || return 0   # no hasher -> never block real work
+  cd="$CLAIMS_REMOTE/$k"
+  $SSH "$NAS" "mkdir -p ${CLAIMS_REMOTE@Q} 2>/dev/null; if mkdir ${cd@Q} 2>/dev/null; then echo OK; \
+    elif [ -n \"\$(find ${cd@Q} -maxdepth 0 -mmin +${CLAIM_TTL_MIN} 2>/dev/null)\" ]; then \
+    rm -rf ${cd@Q} 2>/dev/null; mkdir ${cd@Q} 2>/dev/null && echo OK; fi" </dev/null 2>/dev/null | grep -q OK
+}
+reap_claims(){  # drop stale/orphaned claim dirs so the dir doesn't grow forever
+  { [ "$DRY_RUN" = 1 ] || [ "$LIMIT" -gt 0 ]; } && return 0
+  $SSH "$NAS" "find ${CLAIMS_REMOTE@Q} -mindepth 1 -maxdepth 1 -type d -mmin +${CLAIM_TTL_MIN} -exec rm -rf {} + 2>/dev/null" </dev/null 2>/dev/null || true
 }
 
 # atomic in-place replace ON the NAS (runs remotely where the original + dataset live)
@@ -194,6 +198,9 @@ process(){  # remote source path
   if [ -n "$final" ]; then
     log "  DONE ${gain}% smaller ($(hsize "$SIZE") -> $(hsize "$osz")) in $((t1-t0))s -> $(basename "$final")"
     state_set "$rf" done "gain=${gain}% $((t1-t0))s vt$VT_QUALITY $(basename "$final")"; PROCESSED=$((PROCESSED+1))
+    record_savings "$SIZE" "$osz" "$(basename "$final")"   # local ledger
+    printf '%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$HOSTTAG" "$SIZE" "$osz" "$(basename "$final")" \
+      | $SSH "$NAS" "cat >> ${SAVINGS_REMOTE@Q}" 2>/dev/null || true   # shared ledger
   else
     log "  REPLACE FAILED: $base"; state_set "$rf" failed "replace"
   fi
@@ -202,6 +209,7 @@ process(){  # remote source path
 
 run_pass(){
   load_state
+  reap_claims
   local n=0; PROCESSED=0
   log "PASS start (slice: $(echo "$SLICE" | tr '\n' ',' | sed 's/,$//'))  vt=$VT_QUALITY conc=$CONCURRENCY dry=$DRY_RUN"
   # read the whole list into an array first so nothing in the loop (ffmpeg, ssh) eats a live stdin pipe
@@ -213,6 +221,7 @@ run_pass(){
     if [ -n "$st" ]; then
       if [ "$st" = failed ] && [ "$RETRY_FAILED" = 1 ]; then :; else continue; fi
     fi
+    claim "$rf" || { log "SKIP(claimed by another node): $(basename "$rf")"; continue; }
     if [ "$CONCURRENCY" -le 1 ]; then
       process "$rf"
       [ "$LIMIT" -gt 0 ] && [ "$PROCESSED" -ge "$LIMIT" ] && { log "hit LIMIT=$LIMIT"; break; }

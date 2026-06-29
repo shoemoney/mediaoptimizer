@@ -39,6 +39,7 @@ ENCODER="${ENCODER:-qsv}"              # qsv (Intel iGPU) | videotoolbox (Apple 
 VT_QUALITY="${VT_QUALITY:-60}"         # hevc_videotoolbox constant quality -q:v (1-100, higher=better)
 
 STATE="${STATE:-$WORK/state.tsv}"; LOG="${LOG:-$WORK/convert.log}"; LOCK="${LOCK:-$WORK/.lock}"
+SAVINGS="${SAVINGS:-$WORK/savings.tsv}"   # durable, never-rotated before/after byte ledger
 mkdir -p "$WORK"; touch "$STATE"
 
 # ---- platform shims (GNU/Linux for the QSV box vs BSD/macOS for Apple Silicon) ----
@@ -60,7 +61,9 @@ case "$(uname -s)" in
 esac
 
 log(){ printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG" >&2; }
-hsize(){ numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || echo "${1}B"; }
+# shared logic — classify/calc_scale/verify/hsize/compact_state/record_savings.
+# In the container hevcctl sets HEVC_LIB=/work/hevc-lib.sh (the lib lives in WORKDIR).
+source "${HEVC_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hevc-lib.sh}"
 
 # single instance (flock on Linux; atomic mkdir+PID lock on macOS, which has no flock)
 if command -v flock >/dev/null 2>&1; then
@@ -110,25 +113,7 @@ probe(){
   fi
 }
 
-# Decide using probed vars -> echo "convert" or "skip:<reason>"
-classify(){
-  case "$V_CODEC" in hevc|h265|av1) echo "skip:already-hevc"; return;; esac
-  case "$V_TRC"   in smpte2084|arib-std-b67) echo "skip:hdr"; return;; esac
-  case "$V_PRIM"  in bt2020|bt2020nc|bt2020c) echo "skip:hdr"; return;; esac
-  if ! { [ "$V_W" -ge 1920 ] 2>/dev/null || [ "$V_H" -ge 1080 ] 2>/dev/null; }; then
-    echo "skip:lowres"; return; fi
-  if [ "${EFFKBPS:-0}" -lt "$MIN_SRC_KBPS" ]; then echo "skip:lowbitrate"; return; fi
-  echo "convert"
-}
-
-# Only-downscale to fit MAX_WxMAX_H, keep AR, even dims -> sets SCALE_W SCALE_H ("" = no scale)
-calc_scale(){
-  SCALE_W=""; SCALE_H=""
-  awk "BEGIN{exit !($V_W<=$MAX_W && $V_H<=$MAX_H)}" && return
-  read -r SCALE_W SCALE_H < <(awk -v w="$V_W" -v h="$V_H" -v mw="$MAX_W" -v mh="$MAX_H" 'BEGIN{
-    f=mw/w; g=mh/h; s=(f<g)?f:g; nw=int(w*s); nh=int(h*s);
-    nw-=nw%2; nh-=nh%2; if(nw<2)nw=2; if(nh<2)nh=2; printf "%d %d", nw, nh}')
-}
+# classify() and calc_scale() now live in hevc-lib.sh (sourced above)
 
 # encode src tmp fmt  (uses SCALE_W/SCALE_H) -> 0 ok
 encode(){
@@ -172,17 +157,7 @@ encode(){
   return 1
 }
 
-# verify tmp (uses DUR for source duration) -> 0 ok
-verify(){
-  local tmp="$1" oc od
-  [ -s "$tmp" ] || { log "  verify: empty output"; return 1; }
-  oc=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$tmp" 2>/dev/null)
-  [ "$oc" = hevc ] || { log "  verify: out codec=$oc (want hevc)"; return 1; }
-  od=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$tmp" 2>/dev/null)
-  awk -v a="${DUR:-0}" -v b="${od:-0}" 'BEGIN{d=a-b; if(d<0)d=-d; tol=a*0.01; if(tol<3)tol=3; exit !(b>0 && d<=tol)}' \
-    || { log "  verify: duration mismatch src=$DUR out=$od"; return 1; }
-  return 0
-}
+# verify() now lives in hevc-lib.sh (sourced above) — incl. the decode-sample check
 
 prune_trash(){
   local td="$1" cap=$((TRASH_CAP_GB*1024*1024)) used oldest
@@ -211,7 +186,7 @@ replace_file(){
 }
 
 declare -A DONE
-load_state(){ DONE=(); local p s; while IFS=$'\t' read -r p s _; do [ -n "$p" ] && DONE["$p"]="$s"; done < "$STATE"; }
+load_state(){ compact_state "$STATE"; DONE=(); local p s; while IFS=$'\t' read -r p s _; do [ -n "$p" ] && DONE["$p"]="$s"; done < "$STATE"; }
 
 run_pass(){
   load_state
@@ -274,6 +249,7 @@ run_pass(){
     local final; final=$(replace_file "$f" "$tmp" "$outext"); t1=$(date +%s)
     log "  DONE ${gain}% smaller ($(hsize "$SIZE") -> $(hsize "$osz")) in $((t1-t0))s -> $(basename "$final")"
     state_set "$f" done "gain=${gain}% $((t1-t0))s $(basename "$final")"
+    record_savings "$SIZE" "$osz" "$(basename "$final")"
     processed=$((processed+1))
     [ "$LIMIT" -gt 0 ] && [ "$processed" -ge "$LIMIT" ] && { log "hit LIMIT=$LIMIT"; break; }
     sleep "$SLEEP_BETWEEN"

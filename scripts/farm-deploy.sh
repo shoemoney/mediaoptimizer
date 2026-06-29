@@ -9,6 +9,8 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WORKER="$HERE/farm-worker.sh"
+LIB="$HERE/hevc-lib.sh"
+[ -f "$LIB" ] || { echo "missing $LIB (shared logic sourced by farm-worker.sh)"; exit 1; }
 CONF="${CONF:-$HERE/farm.conf}"
 [ -f "$CONF" ] || { echo "missing config: $CONF  (copy farm.conf.example -> farm.conf and edit)"; exit 1; }
 # shellcheck disable=SC1090
@@ -22,6 +24,7 @@ deploy_one(){
   echo "=== deploy $H (concurrency=$conc) ==="
   ssh "$H" "mkdir -p ${NODE_DIR@Q}"
   scp -q "$WORKER" "$H:$NODE_DIR/farm-worker.sh"
+  scp -q "$LIB" "$H:$NODE_DIR/hevc-lib.sh"
   # install the launchd daemon (runs as $NODE_USER so it has that user's ssh keys; KeepAlive auto-restarts)
   ssh "$H" "sudo tee $PLIST >/dev/null" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -42,6 +45,9 @@ deploy_one(){
     <key>SLICE</key><string>$slice</string>
     <key>CONCURRENCY</key><string>$conc</string>
     <key>WORK</key><string>$NODE_DIR</string>
+    <key>HEVC_LIB</key><string>$NODE_DIR/hevc-lib.sh</string>
+    <key>CLAIMS_REMOTE</key><string>${CLAIMS_REMOTE:-$REMOTE_ROOT/.hevc-claims}</string>
+    <key>SAVINGS_REMOTE</key><string>${SAVINGS_REMOTE:-$REMOTE_ROOT/.hevc-savings.tsv}</string>
     <key>PATH</key><string>$(dirname "$NODE_BASH"):/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
   <key>UserName</key><string>$NODE_USER</string>
