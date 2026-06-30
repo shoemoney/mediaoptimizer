@@ -21,6 +21,8 @@ WORK="${WORK:-$HOME/hevc-farm}"                             # local scratch + st
 STATE_REMOTE="${STATE_REMOTE:-$REMOTE_ROOT/.hevc-farm-state.tsv}"  # shared progress state on the NAS
 CLAIMS_REMOTE="${CLAIMS_REMOTE:-$REMOTE_ROOT/.hevc-claims}"   # per-file claim dirs (atomic mkdir) so 2 nodes don't both encode one file
 CLAIM_TTL_MIN="${CLAIM_TTL_MIN:-180}"                          # steal/expire a claim older than this (covers a crashed node)
+STATE_LOCK="${STATE_LOCK:-$REMOTE_ROOT/.hevc-state.lock}"     # single-writer lock (atomic mkdir) for compacting the shared state.tsv
+STATE_LOCK_TTL_MIN="${STATE_LOCK_TTL_MIN:-30}"                # steal a state-compaction lock older than this (covers a crashed node)
 SAVINGS_REMOTE="${SAVINGS_REMOTE:-$REMOTE_ROOT/.hevc-savings.tsv}"  # shared durable before/after byte ledger
 VT_QUALITY="${VT_QUALITY:-60}"                              # hevc_videotoolbox -q:v (1-100)
 VT_CODEC="${VT_CODEC:-hevc}"                                # hevc | av1  (#12; av1_videotoolbox needs M3+)
@@ -49,6 +51,8 @@ ARR_KIND="${ARR_KIND:-sonarr}"          # sonarr | radarr
 # Pre-pull free-space guard: skip a file if local WORK volume can't hold ~2.2x its size
 # (default 0 = feature off; set e.g. SPACE_GUARD=1 to enable)
 SPACE_GUARD="${SPACE_GUARD:-1}"         # 1=on (safe default); set 0 to disable
+# NAS pool free-space guard: skip the remote replace if the NAS pool has less than this free
+NAS_MIN_FREE_GB="${NAS_MIN_FREE_GB:-50}"  # leave a file for a later pass rather than push onto a full pool
 # Path excludes: newline-separated glob patterns; matching paths are silently skipped
 EXCLUDE="${EXCLUDE:-}"                  # e.g. "*/extras/*\n*/featurettes/*"
 { [ "$LIMIT" -gt 0 ] || [ "$DRY_RUN" = 1 ]; } && CONCURRENCY=1   # keep tests deterministic / sequential
@@ -105,9 +109,37 @@ load_state(){
   compact_state "$STATE_LOCAL"   # single-writer (lock.d) — safe to dedupe in place
   DONE=(); local cache="$WORK/state.remote"
   $SSH "$NAS" "cat ${STATE_REMOTE@Q}" </dev/null >"$cache" 2>/dev/null || true
+  compact_remote_state "$cache"  # opportunistically shrink the shared append-only state (one node wins via lock)
   local p s
   if [ -f "$cache" ]; then while IFS=$'\t' read -r p s _; do [ -n "$p" ] && DONE["$p"]="$s"; done < "$cache"; fi
   while IFS=$'\t' read -r p s _; do [ -n "$p" ] && DONE["$p"]="$s"; done < "$STATE_LOCAL"
+}
+
+# The shared $STATE_REMOTE is append-only (state_set's `cat >>`), so it grows forever and every
+# node re-pulls the whole thing each pass. Once per pass, ONE node grabs an atomic-mkdir lock (same
+# style as claim()) and, only if dedup actually shrinks it meaningfully, replaces it with a compacted
+# copy via temp-then-atomic-mv (never truncate-in-place — a concurrent appender could interleave).
+# ponytail: an append landing between our pull and the mv is lost, but it re-appears next pass from
+#           that node's own $STATE_LOCAL — acceptable, and the lock keeps two compactors from racing.
+compact_remote_state(){  # $1 = already-pulled local cache of $STATE_REMOTE
+  [ "$DRY_RUN" = 1 ] && return 0
+  local cache="$1"; [ -s "$cache" ] || return 0
+  # reap a stale lock at start, like reap_claims
+  $SSH "$NAS" "[ -n \"\$(find ${STATE_LOCK@Q} -maxdepth 0 -mmin +${STATE_LOCK_TTL_MIN} 2>/dev/null)\" ] && rm -rf ${STATE_LOCK@Q} 2>/dev/null" </dev/null 2>/dev/null || true
+  $SSH "$NAS" "mkdir ${STATE_LOCK@Q} 2>/dev/null && echo OK" </dev/null 2>/dev/null | grep -q OK || return 0  # someone else has it — no thundering herd
+  local before after; before=$(wc -l <"$cache" 2>/dev/null); before=${before// /}
+  local comp="$cache.compact"; cp "$cache" "$comp" 2>/dev/null && compact_state "$comp"
+  after=$(wc -l <"$comp" 2>/dev/null); after=${after// /}
+  local saved=$((before - after))
+  # worth it only if it shrinks meaningfully: >=20% fewer lines AND >=500 lines saved
+  if [ "$saved" -lt 500 ] || [ $((saved * 5)) -lt "$before" ]; then
+    rm -f "$comp"; $SSH "$NAS" "rmdir ${STATE_LOCK@Q} 2>/dev/null" </dev/null 2>/dev/null || true; return 0
+  fi
+  local rtmp="$STATE_REMOTE.compact.$$"
+  if $SSH "$NAS" "cat > ${rtmp@Q} && mv ${rtmp@Q} ${STATE_REMOTE@Q}" <"$comp" 2>/dev/null; then
+    log "compacted shared state: $before -> $after lines (saved $saved)"; cp "$comp" "$cache" 2>/dev/null
+  fi
+  rm -f "$comp"; $SSH "$NAS" "rmdir ${STATE_LOCK@Q} 2>/dev/null" </dev/null 2>/dev/null || true
 }
 
 # probe a file ON THE NAS via a persistent ffmpeg container (NO pull) -> sets V_* DUR SIZE EFFKBPS.
@@ -245,6 +277,13 @@ process(){  # remote source path
   local osz gain; osz=$(stat -f%z "$lout"); gain=$(awk -v o="$osz" -v s="$SIZE" 'BEGIN{printf "%d",(s>0)?(100-(o*100/s)):0}')
   if [ "$gain" -lt "$MIN_GAIN_PCT" ]; then
     log "  NO-GAIN (${gain}%); keeping original: $base"; rm -f "$lsrc" "$lout"; state_set "$rf" "skip-nogain" "gain=${gain}%"; return; fi
+
+  # NAS pool free-space guard: don't push onto a near-full pool — leave it for a later pass (transient, NOT failed)
+  if [ "$DRY_RUN" != 1 ]; then
+    local free; free=$($SSH "$NAS" "df -BG --output=avail ${REMOTE_ROOT@Q} 2>/dev/null | tail -1 | tr -dc '0-9'" </dev/null 2>/dev/null)
+    if [ -n "$free" ] && [ "$free" -lt "$NAS_MIN_FREE_GB" ]; then
+      log "  SKIP(NAS low space: ${free}G < ${NAS_MIN_FREE_GB}G): $base"; rm -f "$lsrc" "$lout" "$FERR"; return; fi
+  fi
 
   dir=$(dirname "$rf"); rtmp="$dir/.${base}.hevctmp.$outext"
   if ! $SSH "$NAS" "cat > ${rtmp@Q}" <"$lout"; then
