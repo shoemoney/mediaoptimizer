@@ -184,9 +184,35 @@ git clone <your-fork> mediaoptimizer && cd mediaoptimizer/scripts
 cp farm.conf.example farm.conf
 $EDITOR farm.conf          # nodes, slices, NAS host, paths
 
-# 2. deploy auto-restarting daemons to every node
+# 2. sanity-check the config, then deploy auto-restarting daemons to every node
+./farm-deploy.sh check     # 🆕 lint: NAS path, hosts reachable, slices disjoint
 ./farm-deploy.sh           # all nodes
 ./farm-deploy.sh status    # pulse check
+```
+
+### 🔔 Event-driven — convert on import (`*arr`)
+
+Stop waiting for the hourly rescan. Point Sonarr/Radarr at `hevc-enqueue.sh` and new media converts within ~60s:
+
+> **Settings → Connect → + → Custom Script** · Path: `hevc-enqueue.sh` · Triggers: **On Import** + **On Upgrade**
+
+```bash
+# *arr runs the script inside its container, so map its path to the NAS-host path the workers pull:
+#   QUEUE_FILE=/tv/.hevc-queue   PATH_MAP=/tv=/mnt/tank/media/videos/TV
+# Test it by hand:
+./hevc-enqueue.sh /mnt/tank/media/videos/TV/Show/S01E01.mkv   # -> appended to .hevc-queue
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Sonarr/Radarr
+    participant Q as .hevc-queue (NAS)
+    participant W as farm worker
+    A->>Q: On Import → hevc-enqueue.sh appends path
+    W->>Q: poll every QUEUE_POLL_SECS (60s)
+    Q-->>W: queued path (atomic mv, one node wins)
+    W->>W: claim → pull → encode → verify → atomic replace
 ```
 
 ### 🖥️ Single box (Intel QSV, in Docker)
@@ -206,16 +232,27 @@ MEDIA_DIR=/srv/media WORKDIR=/srv/hevc ./hevcctl.sh start
 |---|---|
 | `./farm-deploy.sh` | Deploy worker + launchd daemon to **all** nodes |
 | `./farm-deploy.sh <host>` | Deploy to one node |
+| `./farm-deploy.sh check` | 🆕 Lint `farm.conf` — NAS path, host reachability, **disjoint** slices, numeric CONC. Run before deploy. |
 | `./farm-deploy.sh status` | Daemon state + recent log per node |
-| `./farm-deploy.sh stop` | Bootout the daemon on all nodes |
+| `./farm-deploy.sh failed` · `retry` | 🆕 Tally failed files by reason · clear them from shared state so the next scan re-attempts |
+| `./farm-deploy.sh kick` · `stop` | Force-restart all daemons · bootout all daemons |
+| `./farm-watchdog.sh` | 🆕 Self-heal: re-bootstrap any node whose launchd job isn't `running`, ntfy alert + dead-man heartbeat. Cron every ~10 min. |
 
 ### `hevcctl.sh`
 
 | Command | Does |
 |---|---|
 | `start` / `stop` / `restart` | Manage the single-box QSV container |
-| `status` | Progress tally + pool free space |
+| `status` · `savings` | Progress tally + pool free · lifetime size-saved from the durable ledger |
+| `failed` · `retry` | 🆕 List failures by reason · restart with `RETRY_FAILED=1` |
 | `logs [N]` · `stats` | Tail the log · live container stats |
+
+### `install.sh` · `scripts/test.sh`
+
+| Command | Does |
+|---|---|
+| `./install.sh` | 🆕 Symlink `hevcctl`/`farm-deploy` onto `PATH` + seed `farm.conf` (no brew tap needed) |
+| `./scripts/test.sh` | 🆕 Zero-dep regression gate: `bash -n` every script + lib/enqueue selfchecks |
 
 ### `farm.conf` (sourced; the only place your real values live — gitignored)
 
@@ -279,7 +316,9 @@ MEDIA_DIR=/srv/media WORKDIR=/srv/hevc ./hevcctl.sh start
 flowchart LR
     A["✅ QSV single-box"] --> B["✅ VideoToolbox farm"]
     B --> C["✅ concurrency + config"]
-    C --> D["🔨 Plex-aware pause"]
+    C --> G["✅ event-driven (*arr)"]
+    G --> H["✅ VMAF gate · AV1 · tiers"]
+    H --> D["🔨 Plex-aware pause"]
     D --> E["⬜ auto-balance slices"]
     E --> F["⬜ web dashboard"]
 ```
@@ -291,10 +330,15 @@ flowchart LR
 | ✅ | Remote-probe optimization (no pull-to-skip) |
 | ✅ | Per-node concurrency + externalized `farm.conf` |
 | ✅ | launchd auto-restart daemons (survives reboot/crash) |
+| ✅ | HDR / Dolby Vision auto-skip (never flattens a master) |
+| ✅ | **Event-driven convert** — `*arr` On Import → `hevc-enqueue.sh` → ~60s latency |
+| ✅ | **Perceptual quality gate** — opt-in VMAF floor (`VMAF_MIN`) before replacing originals |
+| ✅ | **AV1 opt-in** (`VT_CODEC=av1`) with per-box capability probe + HEVC fallback |
+| ✅ | Self-healing `farm-watchdog.sh` (re-bootstrap dead nodes + ntfy + dead-man heartbeat) |
+| ✅ | Per-resolution quality tiers · `farm-deploy check`/`retry` · `test.sh` · `install.sh` |
 | 🔨 | Plex-transcode-aware pause for farm workers |
 | ⬜ | Auto-balance slices by measured node throughput |
 | ⬜ | Web dashboard / live progress UI |
-| ⬜ | AV1 (when Apple Silicon ships hardware AV1 encode) |
 | ⬜ | Optional NFS/SMB transport where the OS cooperates |
 
 ---

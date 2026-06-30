@@ -42,6 +42,9 @@ deploy_one(){
     <key>MEDIA_CANON</key><string>${MEDIA_CANON:-/}</string>
     <key>PROBE_CTR</key><string>${PROBE_CTR:-hevc-probe}</string>
     <key>VT_QUALITY</key><string>${VT_QUALITY:-60}</string>
+    <key>VT_CODEC</key><string>${VT_CODEC:-hevc}</string>
+    <key>TARGET_CODEC</key><string>${TARGET_CODEC:-${VT_CODEC:-hevc}}</string>
+    <key>VMAF_MIN</key><string>${VMAF_MIN:-0}</string>
     <key>SLICE</key><string>$slice</string>
     <key>CONCURRENCY</key><string>$conc</string>
     <key>WORK</key><string>$NODE_DIR</string>
@@ -72,6 +75,32 @@ case "${1:-all}" in
     done ;;
   stop)
     for H in "${HOSTS[@]}"; do echo "=== stop $H ==="; ssh "$H" "sudo launchctl bootout system/$LABEL 2>/dev/null; pkill -f farm-worker.sh; echo stopped"; done ;;
+  check)  # lint farm.conf before you deploy (#5): NAS path, host reachability, disjoint slices, numeric CONC
+    rc=0
+    ssh -o BatchMode=yes -o ConnectTimeout=5 "$NAS" "test -d ${REMOTE_ROOT@Q}" 2>/dev/null \
+      && echo "NAS $NAS REMOTE_ROOT ok" || { echo "✗ NAS $NAS: REMOTE_ROOT $REMOTE_ROOT missing/unreachable"; rc=1; }
+    declare -A seen=()
+    for H in "${HOSTS[@]}"; do
+      ssh -o BatchMode=yes -o ConnectTimeout=5 "$H" true 2>/dev/null && echo "$H reachable" \
+        || { echo "✗ $H unreachable (ssh BatchMode)"; rc=1; }
+      case "${CONC[$H]:-3}" in ''|*[!0-9]*) echo "✗ $H CONC='${CONC[$H]:-}' not numeric"; rc=1;; esac
+      while IFS= read -r d; do [ -z "$d" ] && continue
+        if [ -n "${seen[$d]:-}" ]; then echo "✗ slice '$d' assigned to BOTH ${seen[$d]} and $H"; rc=1
+        else seen[$d]="$H"; fi
+      done <<<"${SLICE[$H]:-}"
+    done
+    [ $rc = 0 ] && echo "✅ farm.conf checks pass" || echo "❌ fix the above before deploy"
+    exit $rc ;;
+  kick)   # force-restart the daemon on every node (interrupts in-progress encodes).
+          # For unattended stall-healing + alerting, cron scripts/farm-watchdog.sh instead (#7).
+    for H in "${HOSTS[@]}"; do echo "kick $H"; ssh "$H" "sudo launchctl kickstart -k system/$LABEL"; done ;;
+  failed) # tally failed entries in the shared state by reason (#8)
+    ssh "$NAS" "awk -F'\t' '\$2==\"failed\"{c[\$4]++} END{for(k in c)printf \"  %-22s %d\n\",k,c[k]}' ${STATE_REMOTE:-$REMOTE_ROOT/.hevc-farm-state.tsv} 2>/dev/null" \
+      | sort || echo "no failures (or no shared state yet)" ;;
+  retry)  # drop failed rows from shared state so the next scan re-attempts them (#8)
+    sr="${STATE_REMOTE:-$REMOTE_ROOT/.hevc-farm-state.tsv}"
+    n=$(ssh "$NAS" "grep -c \$'\tfailed\t' ${sr@Q} 2>/dev/null" || echo 0)
+    ssh "$NAS" "sed -i.bak \$'/\tfailed\t/d' ${sr@Q}" && echo "cleared ${n:-0} failed row(s) from $sr — they retry next scan (backup: $sr.bak)" ;;
   all)  for H in "${HOSTS[@]}"; do deploy_one "$H"; done ;;
   *)    deploy_one "$1" ;;
 esac

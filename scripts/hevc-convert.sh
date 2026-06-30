@@ -37,6 +37,9 @@ PLEX_URL="${PLEX_URL:-http://localhost:32400}"
 PLEX_TOKEN="${PLEX_TOKEN:-}"
 ENCODER="${ENCODER:-qsv}"              # qsv (Intel iGPU) | videotoolbox (Apple Silicon)
 VT_QUALITY="${VT_QUALITY:-60}"         # hevc_videotoolbox constant quality -q:v (1-100, higher=better)
+CODEC="${CODEC:-hevc}"                 # hevc | av1  (#12; av1_qsv on Intel, av1_videotoolbox on M3+)
+TARGET_CODEC="${TARGET_CODEC:-$CODEC}" # verify() expects this output codec_name
+VMAF_MIN="${VMAF_MIN:-0}"              # >0 enables the perceptual quality gate (#1; slow, whole-file)
 
 STATE="${STATE:-$WORK/state.tsv}"; LOG="${LOG:-$WORK/convert.log}"; LOCK="${LOCK:-$WORK/.lock}"
 SAVINGS="${SAVINGS:-$WORK/savings.tsv}"   # durable, never-rotated before/after byte ledger
@@ -64,6 +67,13 @@ log(){ printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG" >&2; }
 # shared logic — classify/calc_scale/verify/hsize/compact_state/record_savings.
 # In the container hevcctl sets HEVC_LIB=/work/hevc-lib.sh (the lib lives in WORKDIR).
 source "${HEVC_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hevc-lib.sh}"
+
+# #12: fall back to hevc if the requested av1 encoder isn't usable on this box (old Intel iGPU
+# lacks av1_qsv; pre-M3 Apple lacks av1_videotoolbox). Probed once at startup.
+if [ "$CODEC" = av1 ]; then
+  _avenc="av1_qsv"; [ "$ENCODER" = videotoolbox ] && _avenc="av1_videotoolbox"
+  codec_supported "$_avenc" || { log "$_avenc unusable here → falling back to hevc"; CODEC=hevc; TARGET_CODEC=hevc; }
+fi
 
 # single instance (flock on Linux; atomic mkdir+PID lock on macOS, which has no flock)
 if command -v flock >/dev/null 2>&1; then
@@ -125,7 +135,8 @@ encode(){
 
   # ===== Apple Silicon VideoToolbox path (Mac nodes) =====
   if [ "$ENCODER" = videotoolbox ]; then
-    local vtenc=(-c:v hevc_videotoolbox -q:v "$VT_QUALITY" -tag:v hvc1 -c:a copy)
+    local vtag=(); [ "$CODEC" = hevc ] && vtag=(-tag:v hvc1)   # hvc1 tag is HEVC-only
+    local vtenc=(-c:v "${CODEC}_videotoolbox" -q:v "$VT_QUALITY" "${vtag[@]}" -c:a copy)
     local vf=(); [ -n "$SCALE_W" ] && vf=(-vf "scale=$SCALE_W:$SCALE_H:flags=lanczos")
     ff -i "$src" "${vf[@]}" "${maps[@]}" "${vtenc[@]}" "${scodec[@]}" "${out[@]}" && return 0
     log "  retrying without subtitles (incompatible sub codec)"
@@ -135,7 +146,7 @@ encode(){
   fi
 
   # ===== Intel QSV path =====
-  local enc=(-c:v hevc_qsv -global_quality "$QUALITY" -preset "$PRESET" -c:a copy)
+  local enc=(-c:v "${CODEC}_qsv" -global_quality "$QUALITY" -preset "$PRESET" -c:a copy)
 
   # ---- Path 1: full hardware (QSV decode + scale + encode) ----
   local hw=(-hwaccel qsv -hwaccel_output_format qsv -i "$src")
@@ -233,15 +244,18 @@ run_pass(){
     local extl fmt outext; extl="${f##*.}"; extl="${extl,,}"
     case "$extl" in mkv) fmt=matroska; outext=mkv;; mp4|m4v) fmt=mp4; outext=mp4;; *) fmt=matroska; outext=mkv;; esac
     calc_scale
+    pick_quality   # per-resolution tier (#4); no-op at the default MAX_H=1080
     local dir base tmp; dir=$(dirname "$f"); base=$(basename "$f"); tmp="$dir/.${base}.hevctmp.$outext"
+    local qtag; [ "$ENCODER" = videotoolbox ] && qtag="q$VT_QUALITY" || qtag="ICQ$QUALITY"
 
-    log "CONVERT $V_CODEC ${V_W}x${V_H} ${EFFKBPS}k -> HEVC ICQ$QUALITY ${SCALE_W:+(${SCALE_W}x${SCALE_H}) }$(hsize "$SIZE"): $base"
+    log "CONVERT $V_CODEC ${V_W}x${V_H} ${EFFKBPS}k -> ${CODEC^^} $qtag ${SCALE_W:+(${SCALE_W}x${SCALE_H}) }$(hsize "$SIZE"): $base"
     if [ "$DRY_RUN" = 1 ]; then state_set "$f" "dry-convert" "${V_W}x${V_H}->${SCALE_W:-keep}"; processed=$((processed+1));
       [ "$LIMIT" -gt 0 ] && [ "$processed" -ge "$LIMIT" ] && break; continue; fi
 
     local t0 t1; t0=$(date +%s)
     if ! encode "$f" "$tmp" "$fmt"; then log "  ENCODE FAILED: $base"; rm -f "$tmp"; state_set "$f" failed "encode"; continue; fi
     if ! verify "$tmp"; then log "  VERIFY FAILED: $base"; rm -f "$tmp"; state_set "$f" failed "verify"; continue; fi
+    if ! vmaf_ok "$tmp" "$f"; then log "  VMAF FAILED: $base"; rm -f "$tmp"; state_set "$f" failed "vmaf"; continue; fi
     local osz gain; osz=$(stat_size "$tmp"); gain=$(awk -v o="$osz" -v s="$SIZE" 'BEGIN{printf "%d",(s>0)?(100-(o*100/s)):0}')
     if [ "$gain" -lt "$MIN_GAIN_PCT" ]; then
       log "  NO-GAIN (${gain}% < ${MIN_GAIN_PCT}%); keeping original: $base"

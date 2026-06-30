@@ -29,14 +29,57 @@ calc_scale(){
     nw-=nw%2; nh-=nh%2; if(nw<2)nw=2; if(nh<2)nh=2; printf "%d %d", nw, nh}')
 }
 
+# pick encode quality by OUTPUT height (SCALE_H if downscaling, else source V_H) -> sets
+# VT_QUALITY (VideoToolbox, higher=better) and QUALITY (QSV global_quality, lower=better).
+# Defaults keep the 1080p tier at the caller's existing values, so with the default
+# MAX_H=1080 (everything ends up 1080) this is a NO-OP. It only bites when you raise MAX_H
+# to KEEP 4K (leaner setting) or feed sub-1080 sources. Each tier is env-overridable.
+# ponytail: 3 tiers; add more only if a resolution band looks wrong in practice.
+pick_quality(){
+  local h="${SCALE_H:-${V_H:-1080}}"; [ -n "$h" ] || h=1080
+  if   [ "$h" -ge 2160 ] 2>/dev/null; then VT_QUALITY="${Q_VT_2160:-50}"; QUALITY="${Q_QSV_2160:-24}"
+  elif [ "$h" -ge 1080 ] 2>/dev/null; then VT_QUALITY="${Q_VT_1080:-${VT_QUALITY:-60}}"; QUALITY="${Q_QSV_1080:-${QUALITY:-22}}"
+  else                                      VT_QUALITY="${Q_VT_SD:-63}";   QUALITY="${Q_QSV_SD:-23}"
+  fi
+}
+
+# optional perceptual quality gate (#1). OFF unless VMAF_MIN>0. Compares output ($1) to
+# source ($2); fails (return 1) if mean VMAF < VMAF_MIN so a visually-broken-but-right-
+# length encode can't silently replace the original. Upscales a downscaled output back to
+# source size (V_WxV_H) for a fair score. If ffmpeg lacks libvmaf it logs and PASSES — an
+# opt-in gate must not hard-block the whole pipeline on a missing filter.
+# ponytail: whole-file VMAF; add `-ss`/`-t` sampling if the gate measurably slows a pass.
+vmaf_ok(){
+  awk "BEGIN{exit !(${VMAF_MIN:-0}>0)}" || return 0   # gate disabled -> pass
+  local dist="$1" ref="$2" pre="" score
+  [ -n "${SCALE_W:-}" ] && pre="scale=${V_W}:${V_H}:flags=bicubic,"
+  score=$(ffmpeg -nostdin -hide_banner -loglevel info -i "$dist" -i "$ref" \
+    -lavfi "[0:v]${pre}setpts=PTS-STARTPTS[d];[1:v]setpts=PTS-STARTPTS[r];[d][r]libvmaf" \
+    -f null - 2>&1 | sed -n 's/.*VMAF score: *//p' | tail -1)
+  [ -z "$score" ] && { log "  vmaf: unavailable (no libvmaf?) — gate skipped"; return 0; }
+  if awk -v s="$score" -v f="${VMAF_MIN}" 'BEGIN{exit !(s+0>=f+0)}'; then
+    log "  vmaf ${score} >= ${VMAF_MIN} ✓"; return 0
+  else
+    log "  vmaf ${score} < ${VMAF_MIN} ✗"; return 1
+  fi
+}
+
+# does this ffmpeg encoder actually work on THIS box? (#4) Definitive 0.1s null-encode probe
+# instead of a hardware matrix — av1_videotoolbox needs M3+ (M1 .4 hard-fails), av1_qsv needs
+# recent Intel. Returns 0 if usable. Callers fall back to hevc when an av1 encoder isn't usable.
+codec_supported(){  # $1 = ffmpeg encoder name, e.g. av1_videotoolbox
+  ffmpeg -hide_banner -loglevel error -f lavfi -i color=c=black:s=64x64:d=0.1:r=5 \
+    -c:v "$1" -f null - </dev/null >/dev/null 2>&1
+}
+
 # verify a finished encode before we trash the original. tmp=LOCAL output file; uses DUR.
 # Checks: non-empty, codec==hevc, duration within 1%, AND (the #3 hardening) actually
 # decodes the first VERIFY_DECODE_SECS so a right-length-but-corrupt file can't pass.
 verify(){
-  local tmp="$1" oc od
+  local tmp="$1" oc od want="${TARGET_CODEC:-hevc}"
   [ -s "$tmp" ] || { log "  verify: empty output"; return 1; }
   oc=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$tmp" 2>/dev/null)
-  [ "$oc" = hevc ] || { log "  verify: out codec=$oc (want hevc)"; return 1; }
+  [ "$oc" = "$want" ] || { log "  verify: out codec=$oc (want $want)"; return 1; }
   od=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$tmp" 2>/dev/null)
   awk -v a="${DUR:-0}" -v b="${od:-0}" 'BEGIN{d=a-b; if(d<0)d=-d; tol=a*0.01; if(tol<3)tol=3; exit !(b>0 && d<=tol)}' \
     || { log "  verify: duration mismatch src=$DUR out=$od"; return 1; }
@@ -45,6 +88,17 @@ verify(){
       || { log "  verify: decode error within first ${VERIFY_DECODE_SECS}s"; return 1; }
   fi
   return 0
+}
+
+# #3: save a just-failed file's ffmpeg stderr to FAILDIR/<hash>.err so the "50 failed, no why"
+# problem is debuggable — the shared $LOG firehose can't be attributed per-file (esp. with
+# concurrent encodes). Call from the failure branch with the source path + the file that holds
+# this attempt's stderr. Best-effort; never fails the caller. `hevcctl failures` reads these.
+capture_fail(){  # $1=source path  $2=stderr file for this attempt
+  local dir="${FAILDIR:-$WORK/fail}" key; key=$(printf '%s' "$1" | shasum 2>/dev/null | cut -c1-16)
+  { [ -n "$key" ] && [ -s "${2:-}" ]; } || return 0
+  mkdir -p "$dir" 2>/dev/null || return 0
+  { printf '# %s\n# failed %s\n' "$1" "$(date '+%F %T')"; tail -40 "$2"; } >"$dir/$key.err" 2>/dev/null || true
 }
 
 # compact a single-writer state.tsv in place: keep the LAST row per path (col1),
@@ -88,5 +142,12 @@ if [ "${1:-}" = --selfcheck ]; then
   t=$(mktemp); printf 'a\t1\nb\t1\na\t2\n' >"$t"; compact_state "$t"
   [ "$(wc -l <"$t")" -eq 2 ] && [ "$(awk -F'\t' '$1=="a"{print $2}' "$t")" = 2 ] || { echo "FAIL compact_state"; rm -f "$t"; exit 1; }
   SAVINGS=$(mktemp); record_savings 1000 400 x; [ "$(savings_report "$SAVINGS" | grep -c '60% smaller')" -eq 1 ] || { echo "FAIL savings"; rm -f "$t" "$SAVINGS"; exit 1; }
+  SCALE_W=1920 SCALE_H=2160 V_H=2160 VT_QUALITY=60 QUALITY=22; pick_quality
+  [ "$VT_QUALITY" = 50 ] && [ "$QUALITY" = 24 ] || { echo "FAIL pick_quality 4k -> $VT_QUALITY/$QUALITY"; rm -f "$t" "$SAVINGS"; exit 1; }
+  SCALE_W="" SCALE_H="" V_H=1080 VT_QUALITY=60 QUALITY=22; pick_quality
+  [ "$VT_QUALITY" = 60 ] && [ "$QUALITY" = 22 ] || { echo "FAIL pick_quality 1080 honors caller -> $VT_QUALITY/$QUALITY"; rm -f "$t" "$SAVINGS"; exit 1; }
+  SCALE_W="" SCALE_H="" V_H=480 VT_QUALITY=60 QUALITY=22; pick_quality
+  [ "$VT_QUALITY" = 63 ] && [ "$QUALITY" = 23 ] || { echo "FAIL pick_quality SD -> $VT_QUALITY/$QUALITY"; rm -f "$t" "$SAVINGS"; exit 1; }
+  VMAF_MIN=0; SCALE_W=""; vmaf_ok /nope/dist /nope/ref || { echo "FAIL vmaf_ok should pass when disabled"; rm -f "$t" "$SAVINGS"; exit 1; }
   rm -f "$t" "$SAVINGS"; echo "hevc-lib selfcheck OK"
 fi

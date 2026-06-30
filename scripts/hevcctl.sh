@@ -23,6 +23,7 @@ start(){
     -e SLEEP_BETWEEN="${SLEEP_BETWEEN:-45}" -e MIN_FREE_GB="${MIN_FREE_GB:-200}" \
     -e MIN_AGE_MIN="${MIN_AGE_MIN:-10}" -e RESCAN_SECS="${RESCAN_SECS:-3600}" \
     -e PLEX_PAUSE="${PLEX_PAUSE:-1}" -e PLEX_TOKEN="$TOK" \
+    -e RETRY_FAILED="${RETRY_FAILED:-0}" -e CODEC="${CODEC:-hevc}" -e VMAF_MIN="${VMAF_MIN:-0}" -e VT_QUALITY="${VT_QUALITY:-60}" \
     ${LOCK:+-e LOCK="$LOCK"} ${SCAN_DIRS:+-e SCAN_DIRS="$SCAN_DIRS"} ${LIMIT:+-e LIMIT="$LIMIT"} ${ONESHOT:+-e ONESHOT="$ONESHOT"} \
     --entrypoint /bin/bash "$IMG" /h.sh >/dev/null
   echo "started $NAME (ICQ=${QUALITY:-22} preset=${PRESET:-slow} mode=${REPLACE_MODE:-trash})"
@@ -52,5 +53,7 @@ case "${1:-status}" in
   logs)    logs "${2:-40}" ;;
   stats)   stats ;;
   savings) savings ;;
-  *) echo "usage: $0 {start|stop|restart|status|logs [N]|stats|savings}";;
+  failed)  sudo awk -F'\t' '$2=="failed"{c[$4]++} END{for(k in c)printf "  %-22s %d\n",k,c[k]}' "$WORKDIR/state.tsv" 2>/dev/null | sort || echo "no failures (or no state.tsv yet)" ;;
+  retry)   stop; RETRY_FAILED=1 start ;;   # re-attempt previously-failed files (#8)
+  *) echo "usage: $0 {start|stop|restart|status|logs [N]|stats|savings|failed|retry}";;
 esac

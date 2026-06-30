@@ -22,7 +22,17 @@ PROBE_CTR="hevc-probe"
 MEDIA_HOST="/srv/media"
 MEDIA_CANON="/media"
 
-VT_QUALITY="60"   # hevc_videotoolbox -q:v (1-100, higher = better/bigger)
+VT_QUALITY="60"   # hevc_videotoolbox -q:v (1-100, higher = better/bigger). The 1080p tier default.
+
+# ---- optional knobs (all have sane defaults; uncomment to change) ----
+# VT_CODEC="hevc"        # hevc | av1  (#12; av1_videotoolbox needs an M3+ media engine)
+# VMAF_MIN="0"           # >0 turns on the perceptual quality gate (#1): reject any encode whose
+#                        # mean VMAF vs the source falls below this (e.g. 93). Slow (whole-file). Off by default.
+# Q_VT_2160="50"; Q_VT_SD="63"   # per-resolution quality tiers (#4); only bite if you raise MAX_H to KEEP 4K
+# QUEUE_POLL_SECS="60"   # how often workers check the import queue between full rescans (#16)
+# --- farm-watchdog.sh (#7), read when you cron it on the control box ---
+# NTFY_URL="https://ntfy.sh/your-topic"   # alert channel for unhealthy/revived nodes (empty = log only)
+# HEARTBEAT_URL="https://hc-ping.com/<uuid>"  # pinged ONLY when all nodes healthy (dead-man switch)
 
 # ---- nodes: one entry per Apple Silicon Mac ----
 HOSTS=(10.0.0.11 10.0.0.12 10.0.0.13)

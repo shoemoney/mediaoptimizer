@@ -23,6 +23,9 @@ CLAIMS_REMOTE="${CLAIMS_REMOTE:-$REMOTE_ROOT/.hevc-claims}"   # per-file claim d
 CLAIM_TTL_MIN="${CLAIM_TTL_MIN:-180}"                          # steal/expire a claim older than this (covers a crashed node)
 SAVINGS_REMOTE="${SAVINGS_REMOTE:-$REMOTE_ROOT/.hevc-savings.tsv}"  # shared durable before/after byte ledger
 VT_QUALITY="${VT_QUALITY:-60}"                              # hevc_videotoolbox -q:v (1-100)
+VT_CODEC="${VT_CODEC:-hevc}"                                # hevc | av1  (#12; av1_videotoolbox needs M3+)
+TARGET_CODEC="${TARGET_CODEC:-$VT_CODEC}"                   # what verify() expects the output codec_name to be
+VMAF_MIN="${VMAF_MIN:-0}"                                   # >0 enables the perceptual quality gate (#1; slow)
 MAX_W="${MAX_W:-1920}"; MAX_H="${MAX_H:-1080}"              # only-downscale ceiling
 MIN_SRC_KBPS="${MIN_SRC_KBPS:-3000}"                        # skip sources already leaner
 MIN_GAIN_PCT="${MIN_GAIN_PCT:-8}"                           # output must be this % smaller
@@ -30,6 +33,8 @@ TRASH_NAME="${TRASH_NAME:-.hevc_trash}"
 TRASH_CAP_GB="${TRASH_CAP_GB:-80}"
 SLEEP_BETWEEN="${SLEEP_BETWEEN:-3}"
 RESCAN_SECS="${RESCAN_SECS:-3600}"
+QUEUE_REMOTE="${QUEUE_REMOTE:-$REMOTE_ROOT/.hevc-queue}"   # event-driven import queue (#16); *arr appends via hevc-enqueue.sh
+QUEUE_POLL_SECS="${QUEUE_POLL_SECS:-60}"                    # how often to check the queue between full rescans
 ONESHOT="${ONESHOT:-0}"; LIMIT="${LIMIT:-0}"; DRY_RUN="${DRY_RUN:-0}"; RETRY_FAILED="${RETRY_FAILED:-0}"
 CONCURRENCY="${CONCURRENCY:-1}"          # parallel encodes per worker (Apple Silicon media engine handles 2-3)
 { [ "$LIMIT" -gt 0 ] || [ "$DRY_RUN" = 1 ]; } && CONCURRENCY=1   # keep tests deterministic / sequential
@@ -48,6 +53,12 @@ SAVINGS="${SAVINGS:-$WORK/savings.tsv}"   # durable, never-rotated before/after 
 log(){ printf '%s [%s] %s\n' "$(date '+%F %T')" "$HOSTTAG" "$*" | tee -a "$LOG" >&2; }
 # shared logic — hsize/classify/calc_scale/verify/compact_state/record_savings (co-located lib)
 source "${HEVC_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hevc-lib.sh}"
+
+# #12: av1_videotoolbox only exists on M3+ media engines (.4's M1 hard-fails). Probe once at
+# startup and fall back to hevc so a mixed fleet can share one config without per-host tweaks.
+if [ "$VT_CODEC" = av1 ] && ! codec_supported av1_videotoolbox; then
+  log "av1_videotoolbox unusable on this box → falling back to hevc"; VT_CODEC=hevc; TARGET_CODEC=hevc
+fi
 
 # single instance (atomic mkdir + PID lock; macOS has no flock)
 LOCKD="$WORK/.lock.d"
@@ -102,7 +113,9 @@ encode(){
   if [ "$fmt" = matroska ]; then maps+=(-map '0:s?' -map '0:t?'); scodec=(-c:s copy)
   else maps+=(-map '0:s?'); scodec=(-c:s mov_text); fi
   local vf=(); [ -n "$SCALE_W" ] && vf=(-vf "scale=$SCALE_W:$SCALE_H:flags=lanczos")
-  local enc=(-c:v hevc_videotoolbox -q:v "$VT_QUALITY" -tag:v hvc1 -c:a copy)
+  # hvc1 tag only applies to HEVC; av1 needs no codec tag. # ponytail: 2 codecs, branch when a 3rd lands
+  local tagv=(); [ "$VT_CODEC" = hevc ] && tagv=(-tag:v hvc1)
+  local enc=(-c:v "${VT_CODEC}_videotoolbox" -q:v "$VT_QUALITY" "${tagv[@]}" -c:a copy)
   local out=(-map_metadata 0 -f "$fmt" "$tmp")
   ffmpeg -nostdin -hide_banner -loglevel error -y -i "$src" "${vf[@]}" "${maps[@]}" "${enc[@]}" "${scodec[@]}" "${out[@]}" 2>>"$LOG" && return 0
   log "  retrying without subtitles (incompatible sub codec)"; rm -f "$tmp"
@@ -175,8 +188,9 @@ process(){  # remote source path
   fi
   case "$ext" in mkv) fmt=matroska; outext=mkv;; mp4|m4v) fmt=mp4; outext=mp4;; *) fmt=matroska; outext=mkv;; esac
   calc_scale
+  pick_quality   # per-resolution tier (#4); no-op at the default MAX_H=1080
 
-  log "CONVERT $V_CODEC ${V_W}x${V_H} ${EFFKBPS}k -> HEVC q$VT_QUALITY ${SCALE_W:+(${SCALE_W}x${SCALE_H}) }$(hsize "$SIZE"): $base"
+  log "CONVERT $V_CODEC ${V_W}x${V_H} ${EFFKBPS}k -> ${VT_CODEC^^} q$VT_QUALITY ${SCALE_W:+(${SCALE_W}x${SCALE_H}) }$(hsize "$SIZE"): $base"
   if [ "$DRY_RUN" = 1 ]; then state_set "$rf" "dry-convert" "${V_W}x${V_H}"; PROCESSED=$((PROCESSED+1)); return; fi
 
   # only now pull the source (we know it converts)
@@ -186,6 +200,7 @@ process(){  # remote source path
   local t0 t1; t0=$(date +%s)
   if ! encode "$lsrc" "$lout" "$fmt"; then log "  ENCODE FAILED: $base"; rm -f "$lsrc" "$lout"; state_set "$rf" failed "encode"; return; fi
   if ! verify "$lout"; then log "  VERIFY FAILED: $base"; rm -f "$lsrc" "$lout"; state_set "$rf" failed "verify"; return; fi
+  if ! vmaf_ok "$lout" "$lsrc"; then log "  VMAF FAILED: $base"; rm -f "$lsrc" "$lout"; state_set "$rf" failed "vmaf"; return; fi
   local osz gain; osz=$(stat -f%z "$lout"); gain=$(awk -v o="$osz" -v s="$SIZE" 'BEGIN{printf "%d",(s>0)?(100-(o*100/s)):0}')
   if [ "$gain" -lt "$MIN_GAIN_PCT" ]; then
     log "  NO-GAIN (${gain}%); keeping original: $base"; rm -f "$lsrc" "$lout"; state_set "$rf" "skip-nogain" "gain=${gain}%"; return; fi
@@ -207,9 +222,26 @@ process(){  # remote source path
   rm -f "$lsrc" "$lout"
 }
 
+# drain the event-driven import queue (#16): atomically grab queued paths (mv → .work so
+# imports arriving mid-drain land in a fresh queue and aren't lost) and run each through the
+# normal claim→process path. The atomic mv also means only ONE node wins the batch; the rest
+# get an empty read. # ponytail: serial drain — fine for trickle imports; parallelize if a
+# bulk re-import floods it. Assumes load_state ran (DONE populated).
+drain_queue(){
+  local work; work=$($SSH "$NAS" "f=${QUEUE_REMOTE@Q}; w=\"\$f.work.$BASHPID\"; [ -s \"\$f\" ] && mv \"\$f\" \"\$w\" && cat \"\$w\" && rm -f \"\$w\"" 2>/dev/null) || return 0
+  [ -z "$work" ] && return 0
+  local rf st
+  while IFS= read -r rf; do [ -z "$rf" ] && continue
+    st="${DONE[$(canon "$rf")]:-}"; { [ -n "$st" ] && [ "$st" != failed ]; } && { log "QUEUE skip(done): $(basename "$rf")"; continue; }
+    claim "$rf" || { log "QUEUE skip(claimed): $(basename "$rf")"; continue; }
+    log "QUEUE convert: $(basename "$rf")"; process "$rf"
+  done <<< "$work"
+}
+
 run_pass(){
   load_state
   reap_claims
+  drain_queue
   local n=0; PROCESSED=0
   log "PASS start (slice: $(echo "$SLICE" | tr '\n' ',' | sed 's/,$//'))  vt=$VT_QUALITY conc=$CONCURRENCY dry=$DRY_RUN"
   # read the whole list into an array first so nothing in the loop (ffmpeg, ssh) eats a live stdin pipe
@@ -238,5 +270,11 @@ run_pass(){
 while :; do
   run_pass
   { [ "$LIMIT" -gt 0 ] || [ "$DRY_RUN" = 1 ] || [ "$ONESHOT" = 1 ]; } && break
-  log "sleeping ${RESCAN_SECS}s before next scan"; sleep "$RESCAN_SECS"
+  # poll the import queue between full rescans so *arr imports convert within ~QUEUE_POLL_SECS (#16)
+  log "idle: full rescan in ${RESCAN_SECS}s, polling queue every ${QUEUE_POLL_SECS}s"
+  slept=0
+  while [ "$slept" -lt "$RESCAN_SECS" ]; do
+    sleep "$QUEUE_POLL_SECS"; slept=$((slept+QUEUE_POLL_SECS))
+    if $SSH "$NAS" "[ -s ${QUEUE_REMOTE@Q} ]" 2>/dev/null; then load_state; drain_queue; fi
+  done
 done
