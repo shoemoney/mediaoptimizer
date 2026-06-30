@@ -9,6 +9,7 @@
 ![encoders](https://img.shields.io/badge/encoders-QSV%20%7C%20VideoToolbox-orange)
 ![deps](https://img.shields.io/badge/deps-ffmpeg%20%2B%20ssh-brightgreen)
 ![status](https://img.shields.io/badge/status-running%20in%20production-success)
+![CI](https://github.com/shoemoney/mediaoptimizer/actions/workflows/ci.yml/badge.svg)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 
 *Re-encode H.264 → HEVC at ~**70% smaller**, **verify before replacing**, never touch what's already lean — and fan the work out across every idle Apple Silicon media engine you own.*
@@ -261,7 +262,10 @@ MEDIA_DIR=/srv/media WORKDIR=/srv/hevc ./hevcctl.sh start
 | `./scripts/hevc-digest.sh` | 🆕 Daily savings digest (last `SINCE_HOURS`) → ntfy or stdout. Cron it. |
 | `./scripts/vmaf-sample.sh <files…>` | 🆕 Measure mean VMAF of a few sample encodes so you can set `VMAF_MIN` from data, not a guess |
 | `./install.sh` | 🆕 Symlink `hevcctl`/`farm-deploy` onto `PATH` + seed `farm.conf` (no brew tap needed) |
-| `./scripts/test.sh` | 🆕 Zero-dep regression gate: `bash -n` every script + lib/enqueue/estimate/digest selfchecks |
+| `./scripts/test.sh` | 🆕 Zero-dep regression gate: `bash -n` every script + lib/enqueue/estimate/digest selfchecks + e2e |
+| `./scripts/test-e2e.sh` | 🆕 **Real** encode→verify smoke test (generates a clip, `libx265`→ shared `verify()`); self-skips if ffmpeg absent |
+
+> 🤖 **CI:** every push runs `test.sh` + `shellcheck --severity=warning` + the e2e encode on [GitHub Actions](.github/workflows/ci.yml) (and Forgejo Actions, given a runner). `.shellcheckrc` documents why info-level ssh-expansion findings are advisory.
 
 ### 🎚️ Worker behavior knobs (optional, all default to no-op)
 
@@ -360,6 +364,7 @@ flowchart LR
 | ✅ | Per-resolution quality tiers · `farm-deploy check`/`retry` · `test.sh` · `install.sh` |
 | ✅ | **One-command undo** (`hevcctl restore`) · **graceful `farm-deploy drain`** · subtitle pre-check · per-file failure stderr · conf-drift lint · claims/probe in status |
 | ✅ | **Shared-state compaction** (locked, per-pass) + **NAS free-space guard** before the farm replace |
+| ✅ | **CI + real e2e test** — GitHub/Forgejo Actions run `test.sh` + `shellcheck` + a live encode→verify on every push |
 | 🔨 | Auto-balance slices by measured node throughput |
 | ⬜ | Web dashboard / live progress UI |
 | ⬜ | Optional NFS/SMB transport where the OS cooperates |
