@@ -117,9 +117,9 @@ encode(){
   local tagv=(); [ "$VT_CODEC" = hevc ] && tagv=(-tag:v hvc1)
   local enc=(-c:v "${VT_CODEC}_videotoolbox" -q:v "$VT_QUALITY" "${tagv[@]}" -c:a copy)
   local out=(-map_metadata 0 -f "$fmt" "$tmp")
-  ffmpeg -nostdin -hide_banner -loglevel error -y -i "$src" "${vf[@]}" "${maps[@]}" "${enc[@]}" "${scodec[@]}" "${out[@]}" 2>>"$LOG" && return 0
+  ffmpeg -nostdin -hide_banner -loglevel error -y -i "$src" "${vf[@]}" "${maps[@]}" "${enc[@]}" "${scodec[@]}" "${out[@]}" 2>>"${FERR:-$LOG}" && return 0
   log "  retrying without subtitles (incompatible sub codec)"; rm -f "$tmp"
-  ffmpeg -nostdin -hide_banner -loglevel error -y -i "$src" "${vf[@]}" -map 0:v:0 -map '0:a?' -sn "${enc[@]}" "${out[@]}" 2>>"$LOG" && return 0
+  ffmpeg -nostdin -hide_banner -loglevel error -y -i "$src" "${vf[@]}" -map 0:v:0 -map '0:a?' -sn "${enc[@]}" "${out[@]}" 2>>"${FERR:-$LOG}" && return 0
   return 1
 }
 # verify() now lives in hevc-lib.sh (sourced above) — incl. the decode-sample check
@@ -195,10 +195,11 @@ process(){  # remote source path
 
   # only now pull the source (we know it converts)
   lsrc="$WORK/src.$BASHPID.$ext"; lout="$WORK/out.$BASHPID.$outext"
+  FERR="$WORK/.ferr.$BASHPID"; : >"$FERR"   # #3: per-encode ffmpeg stderr ($BASHPID = concurrency-safe)
   if ! $SSH "$NAS" "cat ${rf@Q}" </dev/null >"$lsrc"; then log "  PULL FAILED: $base"; rm -f "$lsrc"; state_set "$rf" failed "pull"; return; fi
 
   local t0 t1; t0=$(date +%s)
-  if ! encode "$lsrc" "$lout" "$fmt"; then log "  ENCODE FAILED: $base"; rm -f "$lsrc" "$lout"; state_set "$rf" failed "encode"; return; fi
+  if ! encode "$lsrc" "$lout" "$fmt"; then log "  ENCODE FAILED: $base"; capture_fail "$rf" "$FERR"; rm -f "$lsrc" "$lout"; state_set "$rf" failed "encode"; return; fi
   if ! verify "$lout"; then log "  VERIFY FAILED: $base"; rm -f "$lsrc" "$lout"; state_set "$rf" failed "verify"; return; fi
   if ! vmaf_ok "$lout" "$lsrc"; then log "  VMAF FAILED: $base"; rm -f "$lsrc" "$lout"; state_set "$rf" failed "vmaf"; return; fi
   local osz gain; osz=$(stat -f%z "$lout"); gain=$(awk -v o="$osz" -v s="$SIZE" 'BEGIN{printf "%d",(s>0)?(100-(o*100/s)):0}')

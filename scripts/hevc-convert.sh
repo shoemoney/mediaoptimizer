@@ -93,7 +93,8 @@ NICE=(); command -v nice  >/dev/null && NICE=(nice -n 19)
 command -v ionice >/dev/null && NICE+=(ionice -c 3)
 
 # run ffmpeg with our standard niceness + quiet flags, appending stderr to the log
-ff(){ "${NICE[@]}" ffmpeg -hide_banner -loglevel error -y "$@" 2>>"$LOG"; }
+ff(){ "${NICE[@]}" ffmpeg -hide_banner -loglevel error -y "$@" 2>>"${FERR:-$LOG}"; }
+FERR=""   # #3: per-file ffmpeg stderr target; set before each encode, kept only on failure
 
 state_set(){ printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$(date '+%F %T')" "${3:-}" >>"$STATE"; }
 
@@ -253,7 +254,8 @@ run_pass(){
       [ "$LIMIT" -gt 0 ] && [ "$processed" -ge "$LIMIT" ] && break; continue; fi
 
     local t0 t1; t0=$(date +%s)
-    if ! encode "$f" "$tmp" "$fmt"; then log "  ENCODE FAILED: $base"; rm -f "$tmp"; state_set "$f" failed "encode"; continue; fi
+    FERR="$WORK/.ferr"; : >"$FERR"   # #3: capture THIS file's ffmpeg stderr (ff writes here)
+    if ! encode "$f" "$tmp" "$fmt"; then log "  ENCODE FAILED: $base"; capture_fail "$f" "$FERR"; rm -f "$tmp"; state_set "$f" failed "encode"; continue; fi
     if ! verify "$tmp"; then log "  VERIFY FAILED: $base"; rm -f "$tmp"; state_set "$f" failed "verify"; continue; fi
     if ! vmaf_ok "$tmp" "$f"; then log "  VMAF FAILED: $base"; rm -f "$tmp"; state_set "$f" failed "vmaf"; continue; fi
     local osz gain; osz=$(stat_size "$tmp"); gain=$(awk -v o="$osz" -v s="$SIZE" 'BEGIN{printf "%d",(s>0)?(100-(o*100/s)):0}')
