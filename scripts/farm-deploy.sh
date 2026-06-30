@@ -6,6 +6,7 @@
 #   ./farm-deploy.sh <host>     # one node
 #   ./farm-deploy.sh status     # daemon + progress on all nodes
 #   ./farm-deploy.sh stop       # bootout the daemon on all nodes
+#   ./farm-deploy.sh drain      # let in-flight encodes finish, then stop (graceful)
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WORKER="$HERE/farm-worker.sh"
@@ -63,7 +64,7 @@ deploy_one(){
 </dict></plist>
 PLIST
   # bootout + kill leftover ffmpeg children, then bootstrap (retry once — launchd EIO race if not fully torn down)
-  ssh "$H" "sudo launchctl bootout system/$LABEL 2>/dev/null; pkill -9 -f farm-worker.sh 2>/dev/null; sleep 3; \
+  ssh "$H" "rm -f $NODE_DIR/.drain; sudo launchctl bootout system/$LABEL 2>/dev/null; pkill -9 -f farm-worker.sh 2>/dev/null; sleep 3; \
     sudo launchctl bootstrap system $PLIST 2>/dev/null || { sleep 4; sudo launchctl bootstrap system $PLIST; } && echo '  daemon loaded ✓'"
 }
 
@@ -72,9 +73,27 @@ case "${1:-all}" in
     for H in "${HOSTS[@]}"; do
       echo "=== $H ==="
       ssh "$H" "sudo launchctl print system/$LABEL 2>/dev/null | grep -E 'state =|pid =' ; tail -3 $NODE_DIR/farm.log 2>/dev/null"
-    done ;;
+    done
+    # farm-wide (#10): in-flight claims on the NAS + probe container state. best-effort — don't error if unreachable.
+    echo "=== farm ==="
+    cr="${CLAIMS_REMOTE:-$REMOTE_ROOT/.hevc-claims}"
+    echo "  in-flight claims: $(ssh "$NAS" "ls -1 ${cr@Q} 2>/dev/null | wc -l" 2>/dev/null | tr -d ' ' || echo '?')"
+    echo "  hevc-probe state: $(ssh "$NAS" "sudo docker inspect -f '{{.State.Status}}' ${PROBE_CTR:-hevc-probe} 2>/dev/null" 2>/dev/null || echo '?')" ;;
   stop)
     for H in "${HOSTS[@]}"; do echo "=== stop $H ==="; ssh "$H" "sudo launchctl bootout system/$LABEL 2>/dev/null; pkill -f farm-worker.sh; echo stopped"; done ;;
+  drain)  # graceful stop (#4): drop a .drain flag; worker checks it between files & exits cleanly (current encode finishes).
+          # NOTE the launchd KeepAlive will relaunch the worker — undrain/deploy removes the flag so it restarts; until then it re-exits.
+    drain_timeout="${DRAIN_TIMEOUT:-3600}"   # ponytail: fixed per-node poll cap (default 1h) instead of per-encode ETA math
+    for H in "${HOSTS[@]}"; do
+      echo "=== drain $H ==="
+      ssh "$H" "touch $NODE_DIR/.drain"
+      waited=0
+      while ssh "$H" "pgrep -f farm-worker.sh >/dev/null 2>&1"; do
+        if [ "$waited" -ge "$drain_timeout" ]; then echo "  timeout (still running after ${drain_timeout}s)"; break; fi
+        sleep 10; waited=$((waited + 10))
+      done
+      ssh "$H" "pgrep -f farm-worker.sh >/dev/null 2>&1" || echo "  drained ✓"
+    done ;;
   check)  # lint farm.conf before you deploy (#5): NAS path, host reachability, disjoint slices, numeric CONC
     rc=0
     ssh -o BatchMode=yes -o ConnectTimeout=5 "$NAS" "test -d ${REMOTE_ROOT@Q}" 2>/dev/null \
@@ -89,6 +108,13 @@ case "${1:-all}" in
         else seen[$d]="$H"; fi
       done <<<"${SLICE[$H]:-}"
     done
+    # config-drift warning (#12): keys in farm.conf.example but missing from farm.conf. ponytail: ^KEY= / ^KEY=( names only, warn (don't fail).
+    if [ -f "$CONF.example" ]; then
+      keynames(){ sed -nE 's/^(declare -A )?([A-Za-z_][A-Za-z0-9_]*)=.*/\2/p' "$1" | sort -u; }
+      while IFS= read -r k; do [ -z "$k" ] && continue
+        grep -qE "^(declare -A )?$k=" "$CONF" || echo "⚠ farm.conf missing key '$k' (present in farm.conf.example)"
+      done < <(comm -23 <(keynames "$CONF.example") <(keynames "$CONF"))
+    fi
     [ $rc = 0 ] && echo "✅ farm.conf checks pass" || echo "❌ fix the above before deploy"
     exit $rc ;;
   kick)   # force-restart the daemon on every node (interrupts in-progress encodes).
