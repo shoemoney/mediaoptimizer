@@ -140,9 +140,10 @@ Originals are precious. Nothing gets replaced unless the new file is **provably 
 | 🗑️ **Rolling trash** | Replaced originals go to a size-capped (`TRASH_CAP_GB`) trash in the **same dataset** → the swap is an instant atomic rename, and recent originals stay recoverable (FIFO by insertion time) |
 | 🧊 **Atomic** | `mv` within one dataset — never a half-written file at the real path |
 | 🔒 **Single instance** | `flock` (Linux) / atomic `mkdir`+PID lock (macOS) per node |
-| 🧮 **Free-space floor** | Single-box mode pauses if the pool drops below `MIN_FREE_GB` |
+| 🧮 **Free-space floor** | Single-box pauses below `MIN_FREE_GB`; 🆕 the **farm** also skips the remote replace if the NAS pool is below `NAS_MIN_FREE_GB` (the file is left for a later pass, never pushed onto a full pool) |
 | ♻️ **Restore** | 🆕 `hevcctl restore <path>` pulls an original back out of the rolling trash — one-command undo of a bad conversion |
 | 💬 **Subtitle pre-check** | 🆕 An `ffprobe` check skips the **doomed first encode** when image subs (PGS/DVD/DVB) can't fit the target container — goes straight to the `-sn` pass instead of burning a full failed attempt |
+| 🗜️ **Shared-state compaction** | 🆕 The append-only NAS `state.tsv` is opportunistically deduped (one node wins an atomic `mkdir` lock per pass) so it can't grow unbounded or bloat every node's per-pass re-read |
 
 ---
 
@@ -358,6 +359,7 @@ flowchart LR
 | ✅ | **Savings digest** (`hevc-digest.sh`) + **dry-run estimator** (`hevc-estimate.sh`) + VMAF baseline sampler |
 | ✅ | Per-resolution quality tiers · `farm-deploy check`/`retry` · `test.sh` · `install.sh` |
 | ✅ | **One-command undo** (`hevcctl restore`) · **graceful `farm-deploy drain`** · subtitle pre-check · per-file failure stderr · conf-drift lint · claims/probe in status |
+| ✅ | **Shared-state compaction** (locked, per-pass) + **NAS free-space guard** before the farm replace |
 | 🔨 | Auto-balance slices by measured node throughput |
 | ⬜ | Web dashboard / live progress UI |
 | ⬜ | Optional NFS/SMB transport where the OS cooperates |
