@@ -64,6 +64,21 @@ vmaf_ok(){
   fi
 }
 
+# #5: subtitle codec pre-check — avoid the wasted encode-then-retry-without-subs full pass.
+# Image subs (PGS/DVD/DVB) can't go into mp4's mov_text and break mkv copy in some muxers, so
+# when the target format can't take what the source carries, decide up front to drop them (-sn)
+# instead of burning a doomed first encode. fmt = matroska|mp4 (the -f value); file = source.
+# Returns 0 (incompatible -> drop subs) / 1 (fine -> keep). Best-effort: no ffprobe / no subs -> keep.
+# ponytail: substring match on the 3 image-sub codec_names; text subs (subrip/ass/mov_text) pass.
+subs_incompatible(){  # $1=target fmt  $2=source file
+  local fmt="$1" file="$2" subs
+  subs=$(ffprobe -v error -select_streams s -show_entries stream=codec_name -of csv=p=0 "$file" 2>/dev/null)
+  [ -n "$subs" ] || return 1                       # no subs (or no ffprobe) -> nothing to drop
+  case "$subs" in *hdmv_pgs_subtitle*|*dvd_subtitle*|*dvb_subtitle*) ;; *) return 1;; esac
+  [ "$fmt" = mp4 ] && return 0                      # image subs into mp4/mov_text always fails
+  return 1                                          # mkv copy of image subs generally fine
+}
+
 # does this ffmpeg encoder actually work on THIS box? (#4) Definitive 0.1s null-encode probe
 # instead of a hardware matrix — av1_videotoolbox needs M3+ (M1 .4 hard-fails), av1_qsv needs
 # recent Intel. Returns 0 if usable. Callers fall back to hevc when an av1 encoder isn't usable.
@@ -149,5 +164,11 @@ if [ "${1:-}" = --selfcheck ]; then
   SCALE_W="" SCALE_H="" V_H=480 VT_QUALITY=60 QUALITY=22; pick_quality
   [ "$VT_QUALITY" = 63 ] && [ "$QUALITY" = 23 ] || { echo "FAIL pick_quality SD -> $VT_QUALITY/$QUALITY"; rm -f "$t" "$SAVINGS"; exit 1; }
   VMAF_MIN=0; SCALE_W=""; vmaf_ok /nope/dist /nope/ref || { echo "FAIL vmaf_ok should pass when disabled"; rm -f "$t" "$SAVINGS"; exit 1; }
+  # #5: stub ffprobe to feed fake sub codec lists (no real ffmpeg/files)
+  ffprobe(){ printf '%s\n' "$_FAKE_SUBS"; }
+  _FAKE_SUBS="hdmv_pgs_subtitle";  subs_incompatible mp4 x && subs_incompatible matroska x; [ $? -eq 1 ] || { echo "FAIL subs_incompatible: PGS drop only for mp4"; rm -f "$t" "$SAVINGS"; exit 1; }
+  _FAKE_SUBS="subrip"; subs_incompatible mp4 x; [ $? -eq 1 ] || { echo "FAIL subs_incompatible: text subs should keep"; rm -f "$t" "$SAVINGS"; exit 1; }
+  _FAKE_SUBS=""; subs_incompatible mp4 x; [ $? -eq 1 ] || { echo "FAIL subs_incompatible: no subs should keep"; rm -f "$t" "$SAVINGS"; exit 1; }
+  unset -f ffprobe
   rm -f "$t" "$SAVINGS"; echo "hevc-lib selfcheck OK"
 fi

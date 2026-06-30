@@ -138,6 +138,12 @@ encode(){
     local vtag=(); [ "$CODEC" = hevc ] && vtag=(-tag:v hvc1)   # hvc1 tag is HEVC-only
     local vtenc=(-c:v "${CODEC}_videotoolbox" -q:v "$VT_QUALITY" "${vtag[@]}" -c:a copy)
     local vf=(); [ -n "$SCALE_W" ] && vf=(-vf "scale=$SCALE_W:$SCALE_H:flags=lanczos")
+    # #5: skip the doomed first attempt when source subs can't go in this container (ffprobe pre-check)
+    if subs_incompatible "$fmt" "$src"; then
+      log "  dropping incompatible subs up front (ffprobe pre-check)"
+      ff -i "$src" "${vf[@]}" -map 0:v:0 -map '0:a?' -sn "${vtenc[@]}" "${out[@]}" && return 0
+      return 1
+    fi
     ff -i "$src" "${vf[@]}" "${maps[@]}" "${vtenc[@]}" "${scodec[@]}" "${out[@]}" && return 0
     log "  retrying without subtitles (incompatible sub codec)"
     rm -f "$tmp"
@@ -151,7 +157,13 @@ encode(){
   # ---- Path 1: full hardware (QSV decode + scale + encode) ----
   local hw=(-hwaccel qsv -hwaccel_output_format qsv -i "$src")
   [ -n "$SCALE_W" ] && hw+=(-vf "vpp_qsv=w=$SCALE_W:h=$SCALE_H:scale_mode=hq")
-  ff "${hw[@]}" "${maps[@]}" "${enc[@]}" "${scodec[@]}" "${out[@]}" && return 0
+  # #5: skip subs up front when they can't go in this container — drop straight to -sn, no doomed pass
+  if subs_incompatible "$fmt" "$src"; then
+    log "  dropping incompatible subs up front (ffprobe pre-check)"
+    ff "${hw[@]}" -map 0:v:0 -map '0:a?' -sn "${enc[@]}" "${out[@]}" && return 0
+  else
+    ff "${hw[@]}" "${maps[@]}" "${enc[@]}" "${scodec[@]}" "${out[@]}" && return 0
+  fi
 
   # ---- Path 2: software decode + QSV encode ----
   log "  HW path failed; software-decode + QSV-encode fallback"

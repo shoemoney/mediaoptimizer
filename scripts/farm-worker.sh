@@ -117,6 +117,12 @@ encode(){
   local tagv=(); [ "$VT_CODEC" = hevc ] && tagv=(-tag:v hvc1)
   local enc=(-c:v "${VT_CODEC}_videotoolbox" -q:v "$VT_QUALITY" "${tagv[@]}" -c:a copy)
   local out=(-map_metadata 0 -f "$fmt" "$tmp")
+  # #5: skip the doomed first attempt when the source subs can't go in this container (ffprobe pre-check)
+  if subs_incompatible "$fmt" "$src"; then
+    log "  dropping incompatible subs up front (ffprobe pre-check)"
+    ffmpeg -nostdin -hide_banner -loglevel error -y -i "$src" "${vf[@]}" -map 0:v:0 -map '0:a?' -sn "${enc[@]}" "${out[@]}" 2>>"$LOG" && return 0
+    return 1
+  fi
   ffmpeg -nostdin -hide_banner -loglevel error -y -i "$src" "${vf[@]}" "${maps[@]}" "${enc[@]}" "${scodec[@]}" "${out[@]}" 2>>"$LOG" && return 0
   log "  retrying without subtitles (incompatible sub codec)"; rm -f "$tmp"
   ffmpeg -nostdin -hide_banner -loglevel error -y -i "$src" "${vf[@]}" -map 0:v:0 -map '0:a?' -sn "${enc[@]}" "${out[@]}" 2>>"$LOG" && return 0
@@ -248,6 +254,9 @@ run_pass(){
   local FILES rf active=0; mapfile -d '' FILES < <(list_files)
   for rf in "${FILES[@]}"; do
     [ -z "$rf" ] && continue
+    # honor a co-worker's `farm-deploy drain`: exit cleanly between files when the flag is set
+    # (EXIT trap releases the lock). # ponytail: exit the process; break would just loop the next pass.
+    if [ -e "$WORK/.drain" ]; then log "draining: .drain flag set, exiting after current file"; exit 0; fi
     n=$((n+1))
     local st="${DONE[$(canon "$rf")]:-}"
     if [ -n "$st" ]; then
