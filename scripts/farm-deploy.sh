@@ -101,6 +101,43 @@ case "${1:-all}" in
     sr="${STATE_REMOTE:-$REMOTE_ROOT/.hevc-farm-state.tsv}"
     n=$(ssh "$NAS" "grep -c \$'\tfailed\t' ${sr@Q} 2>/dev/null" || echo 0)
     ssh "$NAS" "sed -i.bak \$'/\tfailed\t/d' ${sr@Q}" && echo "cleared ${n:-0} failed row(s) from $sr — they retry next scan (backup: $sr.bak)" ;;
+  reverify)  # sample-decode already-converted files to catch silent corruption (originals are gone -> alert only)
+    REVERIFY_SAMPLE="${REVERIFY_SAMPLE:-20}"
+    REVERIFY_SECS="${REVERIFY_SECS:-20}"
+    PROBE_CTR="${PROBE_CTR:-hevc-probe}"
+    sr="${STATE_REMOTE:-$REMOTE_ROOT/.hevc-farm-state.tsv}"
+    # pull done-paths from shared state; state col1 is already the canon (container-visible) path
+    mapfile -t DONE_PATHS < <(ssh "$NAS" "cat ${sr@Q} 2>/dev/null" \
+      | awk -F'\t' '$2=="done"{print $1}')
+    total="${#DONE_PATHS[@]}"
+    if [ "$total" -eq 0 ]; then echo "reverify: no done entries in $sr"; exit 0; fi
+    # random sample: prefer sort -R (GNU coreutils); fall back to awk rand (macOS)
+    if sort --version 2>/dev/null | grep -q GNU; then
+      mapfile -t SAMPLE < <(printf '%s\n' "${DONE_PATHS[@]}" | sort -R | head -"$REVERIFY_SAMPLE")
+    else
+      mapfile -t SAMPLE < <(printf '%s\n' "${DONE_PATHS[@]}" \
+        | awk -v n="$REVERIFY_SAMPLE" -v seed="$RANDOM" \
+          'BEGIN{srand(seed)} {lines[NR]=$0} END{
+            for(i=NR;i>=1;i--){j=int(rand()*i)+1; t=lines[i]; lines[i]=lines[j]; lines[j]=t}
+            for(k=1;k<=n&&k<=NR;k++) print lines[k]}')
+    fi
+    sampled="${#SAMPLE[@]}"
+    echo "reverify: sampling $sampled of $total done files (REVERIFY_SECS=$REVERIFY_SECS)"
+    ok=0; fail=0; declare -a FAILED=()
+    for p in "${SAMPLE[@]}"; do
+      [ -z "$p" ] && continue
+      if ssh "$NAS" "sudo docker exec ${PROBE_CTR} ffmpeg -v error -xerror -nostdin -t ${REVERIFY_SECS} -i ${p@Q} -f null -" 2>/dev/null; then
+        echo "  OK   $p"; ok=$((ok+1))
+      else
+        echo "  FAIL $p"; fail=$((fail+1)); FAILED+=("$p")
+      fi
+    done
+    echo "reverify: $sampled sampled, $ok ok, $fail FAILED"
+    if [ "${#FAILED[@]}" -gt 0 ]; then
+      echo "--- files needing re-download ---"
+      printf '  %s\n' "${FAILED[@]}"
+      exit 1
+    fi ;;
   all)  for H in "${HOSTS[@]}"; do deploy_one "$H"; done ;;
   *)    deploy_one "$1" ;;
 esac
