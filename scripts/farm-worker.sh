@@ -343,6 +343,7 @@ run_pass(){
       local _skip=0 _pat
       while IFS= read -r _pat; do
         [ -z "$_pat" ] && continue
+        # shellcheck disable=SC2254  # $_pat is a user-supplied glob — matching as a glob is the intent
         case "$rf" in $_pat) _skip=1; break;; esac
       done <<< "$EXCLUDE"
       [ "$_skip" = 1 ] && { log "SKIP(excluded): $(basename "$rf")"; continue; }

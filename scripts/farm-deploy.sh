@@ -27,6 +27,7 @@ deploy_one(){
   scp -q "$WORKER" "$H:$NODE_DIR/farm-worker.sh"
   scp -q "$LIB" "$H:$NODE_DIR/hevc-lib.sh"
   # install the launchd daemon (runs as $NODE_USER so it has that user's ssh keys; KeepAlive auto-restarts)
+  # shellcheck disable=SC2087  # heredoc vars ($LABEL/$NAS/$slice…) MUST expand client-side before being sent
   ssh "$H" "sudo tee $PLIST >/dev/null" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

@@ -5,7 +5,7 @@
 # ponytail: bats skipped on purpose — plain `bash -n` + assert selfchecks need no framework
 # and run anywhere bash does. Add bats only if a contributor asks for TAP output.
 set -uo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit 1
 rc=0
 for f in *.sh; do
   bash -n "$f" && echo "syntax OK: $f" || { echo "SYNTAX FAIL: $f"; rc=1; }
@@ -14,6 +14,6 @@ bash hevc-lib.sh --selfcheck     || rc=1
 bash hevc-enqueue.sh --selfcheck || rc=1
 bash hevc-estimate.sh --selfcheck || rc=1
 bash hevc-digest.sh --selfcheck  || rc=1
-bash "$(dirname "$0")/test-e2e.sh" || rc=1
+bash test-e2e.sh                 || rc=1   # real encode→verify (self-skips if ffmpeg absent)
 [ $rc = 0 ] && echo "✅ all tests pass" || echo "❌ tests failed"
 exit $rc

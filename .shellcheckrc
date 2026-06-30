@@ -1,4 +1,8 @@
 # .shellcheckrc — shellcheck baseline for the hevc encoder project
+# CI gates at `shellcheck --severity=warning` (see .github/.forgejo workflows): warning+error
+# fail the build, info/style are advisory. This ops-heavy codebase intentionally word-splits
+# $SSH and expands ssh-command strings client-side (SC2029/SC2086 info), so those stay advisory;
+# the two intentional warnings (SC2087 heredoc, SC2254 glob case) carry inline disables.
 shell=bash
 external-sources=true
 

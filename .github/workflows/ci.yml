@@ -17,7 +17,7 @@ jobs:
         run: bash scripts/test.sh
 
       - name: Run shellcheck
-        run: shellcheck scripts/*.sh *.sh
+        run: shellcheck --severity=warning scripts/*.sh *.sh
 
       - name: Run e2e smoke test
         run: bash scripts/test-e2e.sh
