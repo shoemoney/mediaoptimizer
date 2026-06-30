@@ -1,0 +1,21 @@
+# .shellcheckrc — shellcheck baseline for the hevc encoder project
+shell=bash
+external-sources=true
+
+# SC1069 / SC1081 / SC1010: false positives from shellcheck misreading
+# bash associative-array subscripts like `DONE["$k"]` — it parses "DONE" as
+# the keyword `done` and then complains about missing space/semicolons/case.
+# shellcheck 0.9.x–0.11.x can't distinguish `DONE` (assoc-array var) from
+# `done` (loop keyword) in all positions.
+disable=SC1069,SC1081,SC1010
+
+# SC1090: "can't follow non-constant source" — scripts source hevc-lib.sh via
+# a $SCRIPT_DIR variable; shellcheck can't statically resolve it even with
+# external-sources=true.  The directive # shellcheck source=... is added at
+# source sites where it matters; the global suppress covers the remaining ones.
+disable=SC1090
+
+# SC2034: variables like V_TRC, V_PRIM, EFFKBPS, V_CODEC, V_W, V_H are set
+# by callers as an environment contract before sourcing hevc-lib.sh; shellcheck
+# only sees one file at a time and flags them as "unused" inside the lib.
+disable=SC2034
