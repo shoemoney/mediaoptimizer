@@ -37,6 +37,20 @@ QUEUE_REMOTE="${QUEUE_REMOTE:-$REMOTE_ROOT/.hevc-queue}"   # event-driven import
 QUEUE_POLL_SECS="${QUEUE_POLL_SECS:-60}"                    # how often to check the queue between full rescans
 ONESHOT="${ONESHOT:-0}"; LIMIT="${LIMIT:-0}"; DRY_RUN="${DRY_RUN:-0}"; RETRY_FAILED="${RETRY_FAILED:-0}"
 CONCURRENCY="${CONCURRENCY:-1}"          # parallel encodes per worker (Apple Silicon media engine handles 2-3)
+# Plex pause: wait while Plex is transcoding before pulling/encoding each file
+PLEX_PAUSE="${PLEX_PAUSE:-0}"           # 0=off; 1=pause while Plex is transcoding
+PLEX_URL="${PLEX_URL:-http://$NAS:32400}"
+PLEX_TOKEN="${PLEX_TOKEN:-}"
+MAX_PLEX_WAIT_MIN="${MAX_PLEX_WAIT_MIN:-120}"  # give up and proceed after this many minutes
+# *arr refresh: fire one debounced RefreshSeries/Movie after a pass replaces at least one file
+ARR_URL="${ARR_URL:-}"                  # e.g. http://nas:8989 — leave empty to disable
+ARR_KEY="${ARR_KEY:-}"
+ARR_KIND="${ARR_KIND:-sonarr}"          # sonarr | radarr
+# Pre-pull free-space guard: skip a file if local WORK volume can't hold ~2.2x its size
+# (default 0 = feature off; set e.g. SPACE_GUARD=1 to enable)
+SPACE_GUARD="${SPACE_GUARD:-1}"         # 1=on (safe default); set 0 to disable
+# Path excludes: newline-separated glob patterns; matching paths are silently skipped
+EXCLUDE="${EXCLUDE:-}"                  # e.g. "*/extras/*\n*/featurettes/*"
 { [ "$LIMIT" -gt 0 ] || [ "$DRY_RUN" = 1 ]; } && CONCURRENCY=1   # keep tests deterministic / sequential
 HOSTTAG="${HOSTTAG:-$(hostname -s)}"
 SSH="${SSH:-ssh -o ConnectTimeout=10 -o BatchMode=yes}"
@@ -46,6 +60,13 @@ SSH="${SSH:-ssh -o ConnectTimeout=10 -o BatchMode=yes}"
 # Default is identity (no remap) — set both in farm.conf if your container remaps paths.
 MEDIA_HOST="${MEDIA_HOST:-/}"; MEDIA_CANON="${MEDIA_CANON:-/}"
 canon(){ printf '%s' "${1/#$MEDIA_HOST/$MEDIA_CANON}"; }
+
+# plex_busy: returns 0 if Plex has an active transcode session (curl sessions endpoint)
+plex_busy(){
+  [ "$PLEX_PAUSE" = 1 ] && [ -n "$PLEX_TOKEN" ] || return 1
+  local x; x=$(curl -sf -m 5 "$PLEX_URL/status/sessions?X-Plex-Token=$PLEX_TOKEN" 2>/dev/null) || return 1
+  echo "$x" | grep -q 'videoDecision="transcode"'
+}
 
 mkdir -p "$WORK"
 LOG="$WORK/farm.log"; STATE_LOCAL="$WORK/state.tsv"; touch "$STATE_LOCAL"
@@ -193,6 +214,25 @@ process(){  # remote source path
   log "CONVERT $V_CODEC ${V_W}x${V_H} ${EFFKBPS}k -> ${VT_CODEC^^} q$VT_QUALITY ${SCALE_W:+(${SCALE_W}x${SCALE_H}) }$(hsize "$SIZE"): $base"
   if [ "$DRY_RUN" = 1 ]; then state_set "$rf" "dry-convert" "${V_W}x${V_H}"; PROCESSED=$((PROCESSED+1)); return; fi
 
+  # pre-pull space guard: need ~2.2x SIZE bytes free on WORK volume (src + encoded output)
+  if [ "${SPACE_GUARD:-1}" = 1 ] && [ "${SIZE:-0}" -gt 0 ]; then
+    local need_g; need_g=$(awk -v s="$SIZE" 'BEGIN{printf "%d", int(s*2.2/1073741824)+1}')
+    local have_g; have_g=$(df -g "$WORK" 2>/dev/null | awk 'NR==2{print $4}')
+    if [ -n "$have_g" ] && [ "${have_g:-0}" -lt "$need_g" ]; then
+      log "LOW LOCAL SPACE: need ~${need_g}g have ${have_g}g — skipping $base (will retry)"; return
+    fi
+  fi
+
+  # Plex pause: wait up to MAX_PLEX_WAIT_MIN before pulling if Plex is transcoding
+  if [ "$PLEX_PAUSE" = 1 ] && [ -n "$PLEX_TOKEN" ]; then
+    local _pw=0
+    while plex_busy; do
+      if [ "$MAX_PLEX_WAIT_MIN" -gt 0 ] && [ "$_pw" -ge $((MAX_PLEX_WAIT_MIN*60)) ]; then
+        log "Plex still transcoding after ${MAX_PLEX_WAIT_MIN}m; proceeding anyway: $base"; break; fi
+      log "Plex transcoding; waiting 30s before pulling $base"; sleep 30; _pw=$((_pw+30))
+    done
+  fi
+
   # only now pull the source (we know it converts)
   lsrc="$WORK/src.$BASHPID.$ext"; lout="$WORK/out.$BASHPID.$outext"
   FERR="$WORK/.ferr.$BASHPID"; : >"$FERR"   # #3: per-encode ffmpeg stderr ($BASHPID = concurrency-safe)
@@ -214,6 +254,7 @@ process(){  # remote source path
   if [ -n "$final" ]; then
     log "  DONE ${gain}% smaller ($(hsize "$SIZE") -> $(hsize "$osz")) in $((t1-t0))s -> $(basename "$final")"
     state_set "$rf" done "gain=${gain}% $((t1-t0))s vt$VT_QUALITY $(basename "$final")"; PROCESSED=$((PROCESSED+1))
+    _PASS_REPLACED=1   # debounce flag: fire *arr refresh once per pass, not per file
     record_savings "$SIZE" "$osz" "$(basename "$final")"   # local ledger
     printf '%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$HOSTTAG" "$SIZE" "$osz" "$(basename "$final")" \
       | $SSH "$NAS" "cat >> ${SAVINGS_REMOTE@Q}" 2>/dev/null || true   # shared ledger
@@ -243,12 +284,21 @@ run_pass(){
   load_state
   reap_claims
   drain_queue
-  local n=0; PROCESSED=0
+  local n=0; PROCESSED=0; _PASS_REPLACED=0  # _PASS_REPLACED: debounce *arr refresh to once per pass
   log "PASS start (slice: $(echo "$SLICE" | tr '\n' ',' | sed 's/,$//'))  vt=$VT_QUALITY conc=$CONCURRENCY dry=$DRY_RUN"
   # read the whole list into an array first so nothing in the loop (ffmpeg, ssh) eats a live stdin pipe
   local FILES rf active=0; mapfile -d '' FILES < <(list_files)
   for rf in "${FILES[@]}"; do
     [ -z "$rf" ] && continue
+    # per-path exclude: drop paths matching any EXCLUDE glob pattern
+    if [ -n "$EXCLUDE" ]; then
+      local _skip=0 _pat
+      while IFS= read -r _pat; do
+        [ -z "$_pat" ] && continue
+        case "$rf" in $_pat) _skip=1; break;; esac
+      done <<< "$EXCLUDE"
+      [ "$_skip" = 1 ] && { log "SKIP(excluded): $(basename "$rf")"; continue; }
+    fi
     n=$((n+1))
     local st="${DONE[$(canon "$rf")]:-}"
     if [ -n "$st" ]; then
@@ -266,6 +316,13 @@ run_pass(){
   done
   [ "$CONCURRENCY" -gt 1 ] && wait
   log "PASS complete: scanned=$n processed=$PROCESSED"
+  # *arr debounced refresh: one POST per pass if anything was replaced (refreshes all monitored items)
+  if [ -n "$ARR_URL" ] && [ -n "$ARR_KEY" ] && [ "$_PASS_REPLACED" = 1 ]; then
+    local _cmd; [ "$ARR_KIND" = radarr ] && _cmd='RefreshMovie' || _cmd='RefreshSeries'
+    curl -sf -m 10 -X POST -H "X-Api-Key: $ARR_KEY" -H "Content-Type: application/json" \
+      -d "{\"name\":\"$_cmd\"}" "$ARR_URL/api/v3/command" >/dev/null 2>&1 || true
+    log "*arr refresh fired ($ARR_KIND $_cmd)"
+  fi
 }
 
 while :; do
