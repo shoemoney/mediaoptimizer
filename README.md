@@ -141,6 +141,8 @@ Originals are precious. Nothing gets replaced unless the new file is **provably 
 | 🧊 **Atomic** | `mv` within one dataset — never a half-written file at the real path |
 | 🔒 **Single instance** | `flock` (Linux) / atomic `mkdir`+PID lock (macOS) per node |
 | 🧮 **Free-space floor** | Single-box mode pauses if the pool drops below `MIN_FREE_GB` |
+| ♻️ **Restore** | 🆕 `hevcctl restore <path>` pulls an original back out of the rolling trash — one-command undo of a bad conversion |
+| 💬 **Subtitle pre-check** | 🆕 An `ffprobe` check skips the **doomed first encode** when image subs (PGS/DVD/DVB) can't fit the target container — goes straight to the `-sn` pass instead of burning a full failed attempt |
 
 ---
 
@@ -232,8 +234,9 @@ MEDIA_DIR=/srv/media WORKDIR=/srv/hevc ./hevcctl.sh start
 |---|---|
 | `./farm-deploy.sh` | Deploy worker + launchd daemon to **all** nodes |
 | `./farm-deploy.sh <host>` | Deploy to one node |
-| `./farm-deploy.sh check` | 🆕 Lint `farm.conf` — NAS path, host reachability, **disjoint** slices, numeric CONC. Run before deploy. |
-| `./farm-deploy.sh status` | Daemon state + recent log per node |
+| `./farm-deploy.sh check` | 🆕 Lint `farm.conf` — NAS path, host reachability, **disjoint** slices, numeric CONC, **+ missing-key drift vs `farm.conf.example`**. Run before deploy. |
+| `./farm-deploy.sh status` | Daemon state + recent log per node **· in-flight claim count · `hevc-probe` container state** |
+| `./farm-deploy.sh drain` | 🆕 **Graceful stop** — drop a `.drain` flag on every node; each worker finishes its **current** file then exits cleanly (no wasted half-encode). The next deploy clears the flag. |
 | `./farm-deploy.sh failed` · `retry` | 🆕 Tally failed files by reason · clear them from shared state so the next scan re-attempts |
 | `./farm-deploy.sh reverify` | 🆕 Sample-decode already-converted files (`REVERIFY_SAMPLE`) to catch silent corruption — originals are gone, so it alerts |
 | `./farm-deploy.sh kick` · `stop` | Force-restart all daemons · bootout all daemons |
@@ -246,6 +249,7 @@ MEDIA_DIR=/srv/media WORKDIR=/srv/hevc ./hevcctl.sh start
 | `start` / `stop` / `restart` | Manage the single-box QSV container |
 | `status` · `savings` | Progress tally + pool free · lifetime size-saved from the durable ledger |
 | `failed` · `retry` | 🆕 List failures by reason · restart with `RETRY_FAILED=1` |
+| `restore <path>` | 🆕 ♻️ **Undo a bad conversion** — pull the original back from `.hevc_trash` (newest match) and overwrite the converted file |
 | `logs [N]` · `stats` | Tail the log · live container stats |
 
 ### 🛠️ Standalone helpers
@@ -332,7 +336,8 @@ flowchart LR
     C --> G["✅ event-driven (*arr)"]
     G --> H["✅ VMAF gate · AV1 · tiers"]
     H --> I["✅ Plex-pause · reverify · digest"]
-    I --> D["🔨 auto-balance slices"]
+    I --> J["✅ restore · drain · sub-precheck"]
+    J --> D["🔨 auto-balance slices"]
     D --> F["⬜ web dashboard"]
 ```
 
@@ -352,6 +357,7 @@ flowchart LR
 | ✅ | **Re-verify sweep** (`farm-deploy reverify`) — spot-decode converted files for silent corruption |
 | ✅ | **Savings digest** (`hevc-digest.sh`) + **dry-run estimator** (`hevc-estimate.sh`) + VMAF baseline sampler |
 | ✅ | Per-resolution quality tiers · `farm-deploy check`/`retry` · `test.sh` · `install.sh` |
+| ✅ | **One-command undo** (`hevcctl restore`) · **graceful `farm-deploy drain`** · subtitle pre-check · per-file failure stderr · conf-drift lint · claims/probe in status |
 | 🔨 | Auto-balance slices by measured node throughput |
 | ⬜ | Web dashboard / live progress UI |
 | ⬜ | Optional NFS/SMB transport where the OS cooperates |
