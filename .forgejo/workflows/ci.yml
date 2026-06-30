@@ -1,0 +1,25 @@
+# Requires a registered Forgejo Actions runner to execute (see: https://forgejo.org/docs/latest/admin/actions/)
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ffmpeg + shellcheck
+        run: |
+          (sudo apt-get update && sudo apt-get install -y ffmpeg shellcheck) || (apt-get update && apt-get install -y ffmpeg shellcheck)
+
+      - name: Run tests
+        run: bash scripts/test.sh
+
+      - name: Shellcheck
+        run: shellcheck scripts/*.sh *.sh
+
+      - name: Run e2e tests
+        run: bash scripts/test-e2e.sh
