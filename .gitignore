@@ -12,3 +12,4 @@ out.*
 # OS / editor junk
 .DS_Store
 *.swp
+.claude/

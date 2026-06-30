@@ -10,7 +10,9 @@ rc=0
 for f in *.sh; do
   bash -n "$f" && echo "syntax OK: $f" || { echo "SYNTAX FAIL: $f"; rc=1; }
 done
-bash hevc-lib.sh --selfcheck    || rc=1
+bash hevc-lib.sh --selfcheck     || rc=1
 bash hevc-enqueue.sh --selfcheck || rc=1
+bash hevc-estimate.sh --selfcheck || rc=1
+bash hevc-digest.sh --selfcheck  || rc=1
 [ $rc = 0 ] && echo "✅ all tests pass" || echo "❌ tests failed"
 exit $rc

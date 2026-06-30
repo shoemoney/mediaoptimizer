@@ -30,9 +30,26 @@ VT_QUALITY="60"   # hevc_videotoolbox -q:v (1-100, higher = better/bigger). The 
 #                        # mean VMAF vs the source falls below this (e.g. 93). Slow (whole-file). Off by default.
 # Q_VT_2160="50"; Q_VT_SD="63"   # per-resolution quality tiers (#4); only bite if you raise MAX_H to KEEP 4K
 # QUEUE_POLL_SECS="60"   # how often workers check the import queue between full rescans (#16)
+# SPACE_GUARD="1"        # skip a file if the worker's local disk can't hold ~2.2x its size (on by default)
+# EXCLUDE=""             # newline-separated globs; matching library paths are never touched (keep a grain master)
+#
+# --- farm worker: pause while Plex is streaming (optional) ---
+# PLEX_PAUSE="0"         # 1 = wait while Plex has a live transcode before pulling/encoding
+# PLEX_URL="http://NAS:32400"; PLEX_TOKEN=""; MAX_PLEX_WAIT_MIN="120"
+#
+# --- farm worker: tell *arr to re-read the file after replace (optional, debounced 1/pass) ---
+# ARR_URL="http://nas:8989"; ARR_KEY="<api-key>"; ARR_KIND="sonarr"   # sonarr | radarr
+#
 # --- farm-watchdog.sh (#7), read when you cron it on the control box ---
 # NTFY_URL="https://ntfy.sh/your-topic"   # alert channel for unhealthy/revived nodes (empty = log only)
 # HEARTBEAT_URL="https://hc-ping.com/<uuid>"  # pinged ONLY when all nodes healthy (dead-man switch)
+#
+# --- farm-deploy reverify (sample-decode converted files for silent corruption) ---
+# REVERIFY_SAMPLE="20"; REVERIFY_SECS="20"    # how many done-files to spot-check, seconds each
+#
+# --- hevc-digest.sh (daily savings report) / hevc-estimate.sh (dry-run projection) ---
+# SINCE_HOURS="24"       # digest window
+# EST_RATIO="0.42"       # estimator's assumed output/source size ratio (~58% smaller)
 
 # ---- nodes: one entry per Apple Silicon Mac ----
 HOSTS=(10.0.0.11 10.0.0.12 10.0.0.13)

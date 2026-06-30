@@ -235,6 +235,7 @@ MEDIA_DIR=/srv/media WORKDIR=/srv/hevc ./hevcctl.sh start
 | `./farm-deploy.sh check` | 🆕 Lint `farm.conf` — NAS path, host reachability, **disjoint** slices, numeric CONC. Run before deploy. |
 | `./farm-deploy.sh status` | Daemon state + recent log per node |
 | `./farm-deploy.sh failed` · `retry` | 🆕 Tally failed files by reason · clear them from shared state so the next scan re-attempts |
+| `./farm-deploy.sh reverify` | 🆕 Sample-decode already-converted files (`REVERIFY_SAMPLE`) to catch silent corruption — originals are gone, so it alerts |
 | `./farm-deploy.sh kick` · `stop` | Force-restart all daemons · bootout all daemons |
 | `./farm-watchdog.sh` | 🆕 Self-heal: re-bootstrap any node whose launchd job isn't `running`, ntfy alert + dead-man heartbeat. Cron every ~10 min. |
 
@@ -247,12 +248,24 @@ MEDIA_DIR=/srv/media WORKDIR=/srv/hevc ./hevcctl.sh start
 | `failed` · `retry` | 🆕 List failures by reason · restart with `RETRY_FAILED=1` |
 | `logs [N]` · `stats` | Tail the log · live container stats |
 
-### `install.sh` · `scripts/test.sh`
+### 🛠️ Standalone helpers
 
 | Command | Does |
 |---|---|
+| `./scripts/hevc-estimate.sh <root>` | 🆕 **Dry run** — probe + classify a library and project total reclaim before you convert (`EST_RATIO`) |
+| `./scripts/hevc-digest.sh` | 🆕 Daily savings digest (last `SINCE_HOURS`) → ntfy or stdout. Cron it. |
+| `./scripts/vmaf-sample.sh <files…>` | 🆕 Measure mean VMAF of a few sample encodes so you can set `VMAF_MIN` from data, not a guess |
 | `./install.sh` | 🆕 Symlink `hevcctl`/`farm-deploy` onto `PATH` + seed `farm.conf` (no brew tap needed) |
-| `./scripts/test.sh` | 🆕 Zero-dep regression gate: `bash -n` every script + lib/enqueue selfchecks |
+| `./scripts/test.sh` | 🆕 Zero-dep regression gate: `bash -n` every script + lib/enqueue/estimate/digest selfchecks |
+
+### 🎚️ Worker behavior knobs (optional, all default to no-op)
+
+| Env | Effect |
+|---|---|
+| `PLEX_PAUSE=1` + `PLEX_TOKEN` | Farm waits while Plex has a live transcode (`MAX_PLEX_WAIT_MIN` cap) |
+| `ARR_URL` + `ARR_KEY` (`ARR_KIND=sonarr\|radarr`) | After a pass replaces a file, tell \*arr to re-read it (debounced 1/pass) |
+| `SPACE_GUARD=1` *(default on)* | Skip a file if the worker's local disk can't hold ~2.2× its size |
+| `EXCLUDE` | Newline globs the farm never touches (keep a grain master untouched) |
 
 ### `farm.conf` (sourced; the only place your real values live — gitignored)
 
@@ -318,9 +331,9 @@ flowchart LR
     B --> C["✅ concurrency + config"]
     C --> G["✅ event-driven (*arr)"]
     G --> H["✅ VMAF gate · AV1 · tiers"]
-    H --> D["🔨 Plex-aware pause"]
-    D --> E["⬜ auto-balance slices"]
-    E --> F["⬜ web dashboard"]
+    H --> I["✅ Plex-pause · reverify · digest"]
+    I --> D["🔨 auto-balance slices"]
+    D --> F["⬜ web dashboard"]
 ```
 
 | Status | Item |
@@ -335,9 +348,11 @@ flowchart LR
 | ✅ | **Perceptual quality gate** — opt-in VMAF floor (`VMAF_MIN`) before replacing originals |
 | ✅ | **AV1 opt-in** (`VT_CODEC=av1`) with per-box capability probe + HEVC fallback |
 | ✅ | Self-healing `farm-watchdog.sh` (re-bootstrap dead nodes + ntfy + dead-man heartbeat) |
+| ✅ | **Plex-pause for farm workers** + `*arr` refresh-after-replace + pre-pull space guard + path excludes |
+| ✅ | **Re-verify sweep** (`farm-deploy reverify`) — spot-decode converted files for silent corruption |
+| ✅ | **Savings digest** (`hevc-digest.sh`) + **dry-run estimator** (`hevc-estimate.sh`) + VMAF baseline sampler |
 | ✅ | Per-resolution quality tiers · `farm-deploy check`/`retry` · `test.sh` · `install.sh` |
-| 🔨 | Plex-transcode-aware pause for farm workers |
-| ⬜ | Auto-balance slices by measured node throughput |
+| 🔨 | Auto-balance slices by measured node throughput |
 | ⬜ | Web dashboard / live progress UI |
 | ⬜ | Optional NFS/SMB transport where the OS cooperates |
 
