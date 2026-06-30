@@ -37,6 +37,17 @@ status(){
 }
 logs(){ sudo docker logs --tail "${1:-40}" "$NAME" 2>&1 | grep -vE "libva info|setlocale" || true; }
 stats(){ sudo docker stats --no-stream "$NAME"; }
+restore(){  # undo a bad conversion: pull the original back out of the rolling trash (#3)
+  local f="${1:-}"; [ -n "$f" ] || { echo "usage: $0 restore <converted-file-path>" >&2; return 2; }
+  local dir base stem td hit
+  dir=$(dirname "$f"); base=$(basename "$f"); stem="${base%.*}"
+  td="$dir/${TRASH_NAME:-.hevc_trash}"
+  # convert.sh trashes originals as "<orig-basename>.<unix-ts>"; the stem (name sans ext) links them.
+  # ponytail: newest match by mtime via ls -t; assumes no embedded newlines in trash filenames.
+  hit=$(ls -t "$td/$stem".* 2>/dev/null | head -1)
+  [ -n "$hit" ] || { echo "no trash entry for '$stem' in $td" >&2; return 1; }
+  mv -f "$hit" "$f" && echo "restored $(basename "$hit") -> $f"
+}
 savings(){  # exact lifetime totals from the durable ledger (survives log rotation)
   local sf="$WORKDIR/savings.tsv"
   [ -s "$sf" ] || { echo "no savings recorded yet ($sf)"; return; }
@@ -53,7 +64,8 @@ case "${1:-status}" in
   logs)    logs "${2:-40}" ;;
   stats)   stats ;;
   savings) savings ;;
+  restore) restore "${2:-}" ;;   # recover an original from the trash (#3)
   failed)  sudo awk -F'\t' '$2=="failed"{c[$4]++} END{for(k in c)printf "  %-22s %d\n",k,c[k]}' "$WORKDIR/state.tsv" 2>/dev/null | sort || echo "no failures (or no state.tsv yet)" ;;
   retry)   stop; RETRY_FAILED=1 start ;;   # re-attempt previously-failed files (#8)
-  *) echo "usage: $0 {start|stop|restart|status|logs [N]|stats|savings|failed|retry}";;
+  *) echo "usage: $0 {start|stop|restart|status|logs [N]|stats|savings|restore <path>|failed|retry}";;
 esac
